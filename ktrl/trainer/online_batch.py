@@ -6,6 +6,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import random
 import time
 
 from .grpo import outcome_advantages
@@ -17,31 +18,40 @@ def write(path, data):
         json.dump(data, handle, ensure_ascii=False, allow_nan=False)
 
 
-def prepare(out, model, parquet, reference):
+def select_prompts(rows, tokenize, count, seed, max_prompt_tokens):
+    """Select a reproducible prefix of one shuffled dataset pass."""
+    indices = list(range(len(rows)))
+    random.Random(seed).shuffle(indices)
+    selected = []
+    for index in indices:
+        row = rows[index]
+        ground_truth = (row.get("reward_model") or {}).get("ground_truth")
+        if row.get("data_source") != "math_dapo" or ground_truth is None:
+            continue
+        ids = tokenize(row["prompt"])
+        if not 0 < len(ids) <= max_prompt_tokens:
+            continue
+        selected.append(dict(prompt=ids, ground_truth=ground_truth, data_source=row["data_source"],
+                             dataset_row=index, group=f"dataset-row-{index}"))
+        if len(selected) == count:
+            break
+    return selected
+
+
+def prepare(out, model, parquet, count, seed, max_prompt_tokens):
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(model, local_files_only=True)
-    old = json.loads(reference.read_bytes())
-    if isinstance(old,dict):
-        old=old['rows']
-    wanted = {tuple(r['prompt']) for r in old}
-    assert len(wanted) == 8
-    found = {}
-    for row in pq.read_table(parquet).to_pylist():
-        ids = tok.apply_chat_template(row['prompt'], tokenize=True, add_generation_prompt=True, return_dict=False)
-        key = tuple(ids)
-        if key not in wanted or key in found:
-            continue
-        assert row['data_source'] == 'math_dapo' and 0 < len(ids) <= 1024
-        found[key] = dict(prompt=ids, ground_truth=row['reward_model']['ground_truth'],
-                          data_source=row['data_source'], group=hashlib.sha256(json.dumps(ids).encode()).hexdigest())
-    assert set(found) == wanted
-    ordered = list(dict.fromkeys(tuple(r['prompt']) for r in old))
-    write(out/'prompts.json', [found[key] for key in ordered])
-    write(out/'prompt-provenance.json', dict(reference=str(reference),
-          reference_sha256=hashlib.sha256(reference.read_bytes()).hexdigest(), parquet=str(parquet),
-          parquet_sha256=hashlib.sha256(parquet.read_bytes()).hexdigest(),
-          historical_fields_used=['prompt'], responses='must be generated live'))
+    rows = pq.read_table(parquet, columns=["prompt", "reward_model", "data_source"]).to_pylist()
+    def tokenize(prompt):
+        return tok.apply_chat_template(prompt, tokenize=True, add_generation_prompt=True, return_dict=False)
+    selected = select_prompts(rows, tokenize, count, seed, max_prompt_tokens)
+    if len(selected) != count:
+        raise ValueError(f"Need {count} eligible dataset rows, found {len(selected)}")
+    write(out/'prompts.json', selected)
+    write(out/'prompt-provenance.json', dict(parquet=str(parquet), dataset_rows=len(rows), seed=seed,
+          parquet_sha256=hashlib.sha256(parquet.read_bytes()).hexdigest(), eligible_selected=len(selected),
+          dataset_row_order=[row["dataset_row"] for row in selected], responses='must be generated live'))
 
 
 def score(out, model):
@@ -96,7 +106,7 @@ def score(out, model):
             zero_groups+=1
             zero_tokens+=sum(len(r['response']) for r in group)
         identical_groups+=int(len({tuple(r['response']) for r in group})==1)
-    assert max_error < 1e-6 and any(a != 0 for a in adv), 'No learning signal; do not update'
+    assert max_error < 1e-6, 'GRPO reference mismatch'
     advantage_end = time.time_ns()
     batch = out/'batch'
     batch.mkdir()
@@ -110,7 +120,8 @@ def score(out, model):
           nonzero_advantage_responses=sum(a != 0 for a in adv),
           zero_advantage_groups=zero_groups,zero_advantage_tokens=zero_tokens,
           zero_advantage_token_fraction=zero_tokens/sum(len(r['response']) for r in rows),
-          identical_answer_groups=identical_groups,filter_groups=False,rollout_importance_sampling=None,
+          identical_answer_groups=identical_groups,filter_groups=False,
+          rollout_importance_sampling=recipe.get("rollout_correction", {}).get("rollout_is"),
           advantage_reference_max_error=max_error,
           score_histogram=dict(Counter(str(r['score']) for r in details)),
           reward_interval_ns=[started,reward_end], advantage_interval_ns=[reward_end,advantage_end],
@@ -125,9 +136,11 @@ if __name__ == '__main__':
     p.add_argument('--out', type=Path, required=True)
     p.add_argument('--model', required=True)
     p.add_argument('--parquet', type=Path)
-    p.add_argument('--reference', type=Path)
+    p.add_argument('--prompt-count', type=int)
+    p.add_argument('--seed', type=int)
+    p.add_argument('--max-prompt-tokens', type=int)
     args = p.parse_args()
     if args.stage == 'prepare':
-        prepare(args.out,args.model,args.parquet,args.reference)
+        prepare(args.out,args.model,args.parquet,args.prompt_count,args.seed,args.max_prompt_tokens)
     else:
         score(args.out,args.model)

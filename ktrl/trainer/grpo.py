@@ -24,7 +24,20 @@ def outcome_advantages(groups, rewards, group_size, epsilon=1e-6):
     return advantages
 
 
-def policy_loss_sum(logp, old_logp, advantage, mask, clip_low=0.2, clip_high=0.28, dual_clip=3.0):
+def token_tis_weights(old_logp, rollout_logp, threshold):
+    """veRL decoupled token TIS: a detached weight for rollout-to-Actor drift."""
+    import torch
+
+    if rollout_logp.shape != old_logp.shape or not rollout_logp.numel():
+        raise ValueError("token TIS requires one rollout log probability per response token")
+    log_ratio = old_logp.detach().float() - rollout_logp.detach().to(old_logp.device, torch.float32)
+    if not torch.isfinite(log_ratio).all():
+        raise ValueError("token TIS requires finite log probabilities")
+    return log_ratio.clamp(-20, 20).exp().clamp(max=threshold)
+
+
+def policy_loss_sum(logp, old_logp, advantage, mask, clip_low=0.2, clip_high=0.28, dual_clip=3.0,
+                    *, rollout_is_weights=None):
     """Return a sum over valid response tokens for global token-mean normalization."""
     import torch
 
@@ -33,4 +46,7 @@ def policy_loss_sum(logp, old_logp, advantage, mask, clip_low=0.2, clip_high=0.2
     unclipped = -adv * ratio
     clipped = -adv * ratio.clamp(1 - clip_low, 1 + clip_high)
     loss = torch.maximum(unclipped, clipped)
-    return torch.where(adv < 0, torch.minimum(loss, -adv * dual_clip), loss).sum()
+    loss = torch.where(adv < 0, torch.minimum(loss, -adv * dual_clip), loss)
+    if rollout_is_weights is not None:
+        loss = loss * rollout_is_weights.detach()[mask]
+    return loss.sum()
