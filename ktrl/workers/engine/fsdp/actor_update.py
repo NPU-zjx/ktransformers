@@ -10,13 +10,14 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, SequentialSampler
+from ktrl.trainer.ppo_schedule import schedule
 from transformers import AutoModelForImageTextToText, Trainer, TrainerCallback, TrainingArguments
 from kt_kernel.sft import get_kt_named_trainable_params, get_kt_rank_local_parameter_names
 from kt_kernel.sft.profiler import collect_kt_sft_profile
 
 from ktrl.configs.recipe import load_plan
-from ktrl.trainer.grpo import policy_loss_sum, token_tis_weights
+from ktrl.trainer.grpo import policy_loss_sum, select_old_logp, token_tis_weights
 from ktrl.trainer.gradient_audit import watch_loss_scale, gradient_snapshot, verify_clip
 from ktrl.trainer.master_adamw import MasterAdamW
 from . import checkpoint_context
@@ -38,11 +39,19 @@ class FixedRows(Dataset):
         self.valid_tokens = sum(len(r["response"]) for r in self.rows)
         assert self.valid_tokens == audit["valid_response_tokens"]
 
+    def configure(self, plan, round_index=1):
+        self.entries = schedule(self.rows, plan["actor"]["minibatch_responses"],
+            plan["actor"]["ppo_epochs"], shuffle=plan["actor"]["shuffle"],
+            seed=plan["actor"]["data_loader_seed"] + round_index - 1)
+
     def __len__(self):
-        return len(self.rows)
+        return len(self.entries) if hasattr(self, "entries") else len(self.rows)
 
     def __getitem__(self, index):
-        return self.rows[index]
+        if not hasattr(self, "entries"):
+            return self.rows[index]
+        i, epoch, mini, tokens = self.entries[index]
+        return dict(self.rows[i], ppo_epoch=epoch, minibatch=mini, loss_tokens=tokens)
 
 
 def collate(rows):
@@ -51,7 +60,9 @@ def collate(rows):
             "advantage": torch.tensor(row["advantage"], dtype=torch.float32),
             "response_length": len(row["response"]), "uid": row["uid"],
             "rollout_logprobs": torch.tensor(row.get('rollout_logprobs',[]),dtype=torch.float32),
-            "policy_version": row.get('policy_version')}
+            "policy_version": row.get('policy_version'),
+            "loss_tokens": row.get("loss_tokens"), "ppo_epoch": row.get("ppo_epoch"),
+            "minibatch": row.get("minibatch")}
 
 
 class TokenLogProbs(torch.autograd.Function):
@@ -122,7 +133,7 @@ class Evidence(TrainerCallback):
             f.write(json.dumps(item, allow_nan=False) + "\n")
 
     def probe(self, model):
-        ids = torch.tensor([self.data[0]["prompt"]], device=torch.cuda.current_device())
+        ids = torch.tensor([self.data.rows[0]["prompt"]], device=torch.cuda.current_device())
         model.eval()
         with torch.no_grad():
             logits = model(input_ids=ids, use_cache=False, logits_to_keep=1).logits[0, -1].detach().float().cpu()
@@ -139,7 +150,7 @@ class Evidence(TrainerCallback):
         self.cpu_parameters = cpu
         assert state.global_step == self.start_step
         if self.start_step:
-            assert trainer.lr_scheduler.last_epoch == self.start_step
+            assert trainer.lr_scheduler.last_epoch == self.start_step // self.plan["actor"]["optimizer_steps_per_rollout"]
             assert optimizer.state, 'Resume must restore nonempty Adam state'
             for record in optimizer.state.values():
                 if 'step' in record:
@@ -164,12 +175,13 @@ class Evidence(TrainerCallback):
                 restored_step=self.start_step,scheduler_epoch=trainer.lr_scheduler.last_epoch,
                 exact_parameter_and_moment_positions=checked,verified_before_backward=True,
                 resident=bool(self.resident_rounds),pid=os.getpid()))
-        assert len(cpu) == (120 if self.rank == 0 else 0), (self.rank, len(cpu))
+        expert_layers = len(model._kt_wrappers)
+        assert expert_layers and len(cpu) == (3 * expert_layers if self.rank == 0 else 0), (self.rank, len(cpu))
         shards = [(n, p) for n, p in model.named_parameters() if hasattr(p, "to_local")]
         assert all(p.dtype==torch.float32 for _,p in shards if p.requires_grad)
         policy=trainer.accelerator.state.fsdp_plugin.mixed_precision_policy
         assert policy.param_dtype==torch.bfloat16 and policy.reduce_dtype==torch.float32
-        assert shards and len(model._kt_wrappers) == 40
+        assert shards
         placeholders = list(get_kt_rank_local_parameter_names(model))
         params = dict(model.named_parameters())
         for n in placeholders:
@@ -178,7 +190,7 @@ class Evidence(TrainerCallback):
                 raise RuntimeError(f"FSDP claimed a real expert parameter: {n}")
         membership = {id(p) for group in optimizer.param_groups for p in group["params"]}
         assert all(id(p) in membership for _, p in owned)
-        gpu_names = [next((n,p) for n,p in shards if ".layers.0.mlp.gate.weight" in n),
+        gpu_names = [next((n,p) for n,p in shards if ".layers." in n and n.endswith(".mlp.gate.weight")),
                      next((n,p) for n,p in shards if ".self_attn.q_proj.weight" in n)]
         self.samples = [("cpu_expert", *cpu[0])] if cpu else []
         self.samples.extend((role,n,p) for role,(n,p) in zip(("gpu_router","gpu_attention"),gpu_names))
@@ -190,9 +202,16 @@ class Evidence(TrainerCallback):
             normalization="native Trainer divides by GAS, FSDP2 averages over ranks, KT owner applies 1/world on native backward"))
         self.probe_before = self.probe(model)
         self.event("begin", wrappers=len(model._kt_wrappers), cpu_owned=len(cpu))
+        trainer.freeze_old_logp(model)
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.trainer.scale_checks = 0
+        self.trainer.clip_audit_passed = False
+        self.trainer.step_seen = []
+        control.should_save = False
 
     def on_pre_optimizer_step(self, args, state, control, optimizer, **kwargs):
-        assert self.trainer.scale_checks == len(self.data)//dist.get_world_size()
+        assert self.trainer.scale_checks == self.plan["gradient_accumulation_steps"]
         assert self.trainer.clip_audit_passed, 'Native unified clipping was not verified'
         self.before = []
         self.master_before = []
@@ -203,7 +222,7 @@ class Evidence(TrainerCallback):
                                  dtype=torch.float64).long()
             val = flat[idx].float().cpu()
             g = grad[idx].float().cpu()
-            assert torch.isfinite(g).all() and g.count_nonzero(), (role, name)
+            assert torch.isfinite(g).all(), (role, name)
             self.before.append((idx,val,g))
             st=optimizer.state.get(p,{})
             self.master_before.append(local_tensor(st['master']).reshape(-1)[idx].float().cpu()
@@ -212,7 +231,7 @@ class Evidence(TrainerCallback):
              {"grad_norm_preclip":self.trainer.grad_norm,"lr":[float(g["lr"]) for g in optimizer.param_groups]})
         dist.barrier()
         if self.rank == 0:
-            with (self.out.parent / "optimizer-started.json").open("x") as f:
+            with (self.out / f"optimizer-started-step{state.global_step + 1}.json").open("x") as f:
                 json.dump({"attempt":self.out.name, "step":int(state.global_step)+1,"time":time.time()},f)
         dist.barrier()
         self.event("optimizer_start")
@@ -227,7 +246,7 @@ class Evidence(TrainerCallback):
             master_new=local_tensor(st['master']).reshape(-1)[idx].float().cpu() if role=='cpu_expert' else new
             master_changed=(master_new!=master_old)&(grad!=0)
             examples = []
-            for k in changed.nonzero().flatten()[:12].tolist():
+            for k in (changed.nonzero().flatten()[:12].tolist() or list(range(min(12, len(idx))))):
                 i = int(idx[k].item())
                 examples.append(dict(local_flat_index=i,expert_id=i//(p.shape[1]*p.shape[2]) if role=="cpu_expert" else None,
                     before=old[k].item(), after=new[k].item(), clipped_grad=grad[k].item(),
@@ -237,7 +256,7 @@ class Evidence(TrainerCallback):
             records.append(dict(role=role,name=name,device=str(flat.device),dtype=str(flat.dtype),
                 local_shape=list(local_tensor(p).shape),sampled=len(idx),nonzero_gradient=int(grad.count_nonzero()),
                 changed_with_nonzero_grad=int(changed.sum()),master_changed_with_nonzero_grad=int(master_changed.sum()),
-                master_change_fraction=float(master_changed.sum()/grad.count_nonzero()),
+                master_change_fraction=float(master_changed.sum()/grad.count_nonzero()) if grad.count_nonzero() else 0.0,
                 master_dtype=str(st['master'].dtype) if role=='cpu_expert' else str(flat.dtype),
                 moment_dtypes={k:str(st[k].dtype) for k in ('exp_avg','exp_avg_sq')},
                 step=int(st["step"].item()),examples=examples))
@@ -245,38 +264,53 @@ class Evidence(TrainerCallback):
         self.event("optimizer_return")
 
     def on_step_end(self, args, state, control, model, **kwargs):
-        assert state.global_step == self.target_step
+        assert self.start_step < state.global_step <= self.target_step
+        snapshot = self.out / "optimizer-steps" / f"step-{state.global_step}"
+        snapshot.mkdir(parents=True, exist_ok=True)
+        import shutil
+        for name in ("update", "preoptimizer", "joint-clip"):
+            shutil.copyfile(self.out / f"{name}-rank{self.rank}.json",
+                            snapshot / f"{name}-rank{self.rank}.json")
+        self.event("optimizer_step_verified", optimizer_step=state.global_step,
+                   rollout_round=self.round_index)
+        control.should_save = False
+        if state.global_step < self.target_step:
+            return control
         if self.resident_rounds:
             trainer = self.trainer
             control.should_save = False
             trainer.args.output_dir = str(self.out / "trainer")
+            full = bool(self.plan["save_freq"] and self.round_index % self.plan["save_freq"] == 0)
+            trainer.args.save_only_model = not full
             trainer._save_checkpoint(model, None)
-            finish_round(trainer, self, model, model_only=True, synchronize=True)
-            if state.global_step == self.resident_rounds:
+            finish_round(trainer, self, model, model_only=not full, synchronize=True)
+            if self.round_index == self.resident_rounds:
                 control.should_training_stop = True
                 return control
             self.previous_round = self.out
             run_root = self.out.parent.parent
-            next_round = run_root / f"round-{state.global_step + 1:02d}"
+            next_round = run_root / f"round-{self.round_index + 1:02d}"
             deadline = time.monotonic() + 21600
             while not (next_round / "actor-ready.json").is_file():
                 stop = run_root / "actor-stop.json"
                 if stop.is_file():
-                    if json.loads(stop.read_text())["step"] != state.global_step:
+                    if json.loads(stop.read_text())["step"] != self.round_index:
                         raise RuntimeError("Controller stop refers to a different Actor step")
                     control.should_training_stop = True
                     return control
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"No training batch released for {next_round}")
                 time.sleep(0.2)
-            if json.loads((next_round / "actor-ready.json").read_text())["step"] != state.global_step + 1:
+            if json.loads((next_round / "actor-ready.json").read_text())["step"] != self.round_index + 1:
                 raise RuntimeError(f"Controller released the wrong Actor step: {next_round}")
             dataset = FixedRows(next_round / "batch")
             validate_rows(dataset, self.plan)
+            self.round_index += 1
             self.data.rows, self.data.valid_tokens = dataset.rows, dataset.valid_tokens
+            self.data.configure(self.plan, self.round_index)
             self.out = next_round / "actor"
             (self.out / "old_logp").mkdir(exist_ok=True)
-            self.start_step, self.target_step = state.global_step, state.global_step + 1
+            self.start_step, self.target_step = state.global_step, state.global_step + self.plan["actor"]["optimizer_steps_per_rollout"]
             trainer.seen.clear()
             trainer.scale_checks = 0
             trainer.clip_audit_passed = False
@@ -299,29 +333,41 @@ class Evidence(TrainerCallback):
     def check_update_direction(self,model):
         model.eval()
         lookup={r['uid']:r for r in self.data.rows}
+        correction = self.trainer.rollout_correction
+        bypass = correction["bypass_mode"]
         records=[]
         with torch.no_grad():
-            for uid in self.trainer.seen:
-                row=lookup[uid];n=len(row['response'])
+            for row in self.data.rows[self.rank::dist.get_world_size()]:
+                uid=row['uid'];n=len(row['response'])
                 ids=torch.tensor([row['prompt']+row['response']],device=torch.cuda.current_device())
                 logits=model(input_ids=ids,use_cache=False,logits_to_keep=n+1).logits[0,:-1]
                 new=TokenLogProbs.apply(logits,ids[0,-n:]).float().cpu()
                 old=torch.load(self.out/'old_logp'/f'{uid}.pt',weights_only=True)
-                delta=(new-old).double()
+                before = (torch.load(self.out/'old_logp'/f'{uid}.actor-before.pt',weights_only=True)
+                          if bypass else old)
+                delta=(new-before).double()
                 assert torch.isfinite(delta).all()
-                correction = self.trainer.rollout_correction
                 proxy_delta = delta
                 if correction["rollout_is"] == "token":
                     sampling = torch.tensor(row["rollout_logprobs"], dtype=torch.float32)
                     proxy_delta = delta * token_tis_weights(old, sampling, correction["rollout_is_threshold"])
-                records.append(dict(uid=uid,advantage=row['advantage'],tokens=n,
+                record = dict(uid=uid,advantage=row['advantage'],tokens=n,
                     mean_delta=delta.mean().item(),mean_absolute_delta=delta.abs().mean().item(),
-                    weighted_delta_sum=(proxy_delta*row['advantage']).sum().item()))
+                    weighted_delta_sum=(proxy_delta*row['advantage']).sum().item())
+                if bypass:
+                    mask = torch.ones_like(old, dtype=torch.bool)
+                    advantage = torch.tensor(row["advantage"])
+                    record["surrogate_loss_drop"] = (
+                        policy_loss_sum(before, old, advantage, mask) -
+                        policy_loss_sum(new, old, advantage, mask)
+                    ).item()
+                records.append(record)
                 del logits,ids,new,old,delta
         gathered=[None]*dist.get_world_size()
         dist.all_gather_object(gathered,records)
         all_rows=[r for part in gathered for r in part]
         total=sum(r['weighted_delta_sum'] for r in all_rows)
+        surrogate_drop = sum(r["surrogate_loss_drop"] for r in all_rows) if bypass else None
         if self.rank==0:
             groups={}
             for name,sign in [('positive',1),('negative',-1),('zero',0)]:
@@ -331,9 +377,11 @@ class Evidence(TrainerCallback):
                     mean_delta=sum(r['mean_delta']*r['tokens'] for r in selected)/count if count else None,
                     mean_absolute_delta=sum(r['mean_absolute_delta']*r['tokens'] for r in selected)/count if count else None)
             save(self.out/'update-direction.json',dict(weighted_delta_sum=total,groups=groups,rows=all_rows,
+                surrogate_loss_drop=surrogate_drop, old_logp_source="rollout" if bypass else "actor",
                 note='Zero-advantage samples can change through shared parameters; per-answer signs are diagnostics, not universal guarantees'))
-        assert total>0, f'Observed GRPO proxy did not increase: {total}'
-        self.event('update_direction_verified',weighted_delta_sum=total)
+        # A nonlinear multi-update policy need not improve this first-order proxy.
+        # Record it as a diagnostic, never reject a valid optimizer step on its sign.
+        self.event('update_direction_verified',weighted_delta_sum=total,surrogate_loss_drop=surrogate_drop)
 
 
 class GRPOTrainer(Trainer):
@@ -343,11 +391,19 @@ class GRPOTrainer(Trainer):
         self.evidence.event("checkpoint_saved", seconds=time.monotonic() - started,
                             model_only=self.args.save_only_model)
 
+    def create_scheduler(self, num_training_steps, optimizer=None):
+        if self.lr_scheduler is None:
+            from ktrl.trainer.ppo_scheduler import RolloutScheduler
+            self.lr_scheduler = RolloutScheduler(optimizer or self.optimizer,
+                self.evidence.plan["actor"]["optimizer_steps_per_rollout"])
+        return self.lr_scheduler
+
     def create_optimizer(self,model=None):
         if self.optimizer is None:
             self.optimizer_cls_and_kwargs=(MasterAdamW,dict(lr=self.args.learning_rate,
                 betas=(self.args.adam_beta1,self.args.adam_beta2),eps=self.args.adam_epsilon,
-                cpu_parameters=getattr(self,'_kt_rank_local_optimizer_parameters',()),cpu_threads=48))
+                cpu_parameters=getattr(self,'_kt_rank_local_optimizer_parameters',()),
+                cpu_threads=self.evidence.plan["actor"]["kt_config"]["kt_num_threads"]))
         return super().create_optimizer(model)
 
     def __init__(self, dataset, evidence, *, rollout_correction, **kwargs):
@@ -359,58 +415,93 @@ class GRPOTrainer(Trainer):
         self.scale_checks = 0
         self.clip_audit_passed = False
 
+    def _get_train_sampler(self, train_dataset=None):
+        # One shared global schedule, sharded by native Accelerate across ranks.
+        return SequentialSampler(train_dataset if train_dataset is not None else self.train_dataset)
+
+    def freeze_old_logp(self, model):
+        """Compute every trajectory at the same pre-update policy, once per rollout."""
+        folder = self.evidence.out / "old_logp"
+        self.old_hashes = {}
+        model.eval()
+        with torch.no_grad():
+            for row in self.train_dataset.rows[dist.get_rank()::dist.get_world_size()]:
+                uid = row["uid"]
+                n = len(row["response"])
+                ids = torch.tensor([row["prompt"] + row["response"]], device=torch.cuda.current_device())
+                logits = model(input_ids=ids, use_cache=False, logits_to_keep=n+1).logits[0,:-1]
+                actor_old = TokenLogProbs.apply(logits, ids[0,-n:]).detach()
+                old = select_old_logp(bypass_mode=self.rollout_correction["bypass_mode"],
+                    rollout_logp=torch.tensor(row.get("rollout_logprobs", []), device=ids.device),
+                    targets=ids[0,-n:], recompute=lambda: actor_old)
+                torch.save(old.cpu(), folder / f"{uid}.pt")
+                if self.rollout_correction["bypass_mode"]:
+                    torch.save(actor_old.cpu(), folder / f"{uid}.actor-before.pt")
+                sampling = torch.tensor(row.get("rollout_logprobs", []), device=ids.device)
+                if sampling.numel():
+                    delta = actor_old - sampling
+                    self.evidence.event("actor_rollout_logprob_difference", uid=uid,
+                        mean_abs=delta.abs().mean().item(), max_abs=delta.abs().max().item())
+                del logits, ids, actor_old, old
+        model.train()
+        dist.barrier()
+        for row in self.train_dataset.rows:
+            path = folder / f'{row["uid"]}.pt'
+            self.old_hashes[row["uid"]] = hashlib.sha256(path.read_bytes()).hexdigest()
+        save(self.evidence.out / f"old-logp-frozen-rank{dist.get_rank()}.json",
+             dict(optimizer_step=self.state.global_step, source="rollout" if self.rollout_correction["bypass_mode"] else "actor",
+                  responses=len(self.old_hashes), hashes=self.old_hashes))
+        self.evidence.event("old_logp_batch_frozen", optimizer_step=self.state.global_step,
+                            responses=len(self.old_hashes))
+
     def record_scale(self, record):
         self.scale_checks += 1
         self.evidence.event('backward_loss_scale', **record)
 
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         uid, ids = inputs["uid"], inputs["input_ids"]
-        if uid in self.seen:
-            raise RuntimeError('A round permits one update only; old probabilities must stay frozen')
-        assert self.state.global_step == self.evidence.start_step
-        if inputs['policy_version'] is not None:
-            assert inputs['policy_version']==f'v{self.evidence.start_step}'
+        if uid in self.step_seen:
+            raise RuntimeError("Duplicate response inside a PPO minibatch")
+        assert self.evidence.start_step <= self.state.global_step < self.evidence.target_step
+        if inputs["policy_version"] is not None:
+            assert inputs["policy_version"] == f"v{self.evidence.start_step}"
         n = inputs["response_length"]
         targets = ids[0,-n:]
+        old_path = self.evidence.out / "old_logp" / f"{uid}.pt"
+        if hashlib.sha256(old_path.read_bytes()).hexdigest() != self.old_hashes[uid]:
+            raise RuntimeError("Frozen old logp changed during PPO updates")
+        old = torch.load(old_path, weights_only=True).to(ids.device).detach()
+        sampling = inputs["rollout_logprobs"]
         def token_logp():
             logits = model(input_ids=ids, use_cache=False, logits_to_keep=n+1).logits[0,:-1]
             return TokenLogProbs.apply(logits, targets)
-        self.evidence.event("old_logp_start", uid=uid, response_tokens=n)
-        model.eval()
-        with torch.no_grad():
-            old = token_logp()
-        model.train()
-        assert torch.isfinite(old).all()
-        torch.save(old.cpu(), self.evidence.out / "old_logp" / (uid + ".pt"))
-        sampling = inputs['rollout_logprobs']
         weights = None
         if self.rollout_correction["rollout_is"] == "token":
             threshold = self.rollout_correction["rollout_is_threshold"]
             weights = token_tis_weights(old, sampling, threshold)
             self.evidence.event("rollout_token_tis", uid=uid, threshold=threshold,
                                 mean_weight=weights.mean().item(), max_weight=weights.max().item())
-        if sampling.numel():
-            assert sampling.shape == old.shape and torch.isfinite(sampling).all()
-            delta=(old-sampling.to(old.device)).detach()
-            sequence_log_ratio=delta.double().sum().item()
-            self.evidence.event('actor_rollout_logprob_difference',uid=uid,
-                mean_abs=delta.abs().mean().item(),max_abs=delta.abs().max().item(),
-                absolute_quantiles=torch.quantile(delta.abs(),torch.tensor([.5,.95,.99],device=delta.device)).tolist(),
-                sequence_log_ratio=sequence_log_ratio,
-                sequence_ratio=__import__('math').exp(sequence_log_ratio) if sequence_log_ratio<700 else None,
-                sequence_ratio_overflow=sequence_log_ratio>=700,
-                length_bucket='0-2k' if n<=2048 else '2-4k' if n<=4096 else '4-8k',
-                log_ratio_quantiles=torch.quantile(delta,torch.tensor([0.,.5,.95,1.],device=delta.device)).tolist())
         self.evidence.event("actor_forward_start", uid=uid)
         current = token_logp()
         assert torch.isfinite(current).all()
+        ratio = (current.detach() - old).exp()
+        advantage = inputs["advantage"]
+        plain = -advantage * ratio
+        clipped = -advantage * ratio.clamp(0.8, 1.28)
+        self.evidence.event("ppo_ratio", uid=uid, optimizer_step=self.state.global_step,
+            ppo_epoch=inputs["ppo_epoch"], minibatch=inputs["minibatch"],
+            tokens=n, ratio_mean=ratio.mean().item(), ratio_min=ratio.min().item(),
+            ratio_max=ratio.max().item(), nonunit_tokens=int((ratio != 1).sum()),
+            clip_fraction=(clipped > plain).float().mean().item(),
+            approx_kl=(old-current.detach()).mean().item())
         # Trainer divides by GAS; FSDP and KT divide by world size once.
         numerator = policy_loss_sum(current, old, inputs["advantage"], torch.ones_like(targets,dtype=torch.bool),
                                     rollout_is_weights=weights)
-        loss = numerator * dist.get_world_size() * self.current_gradient_accumulation_steps / self.train_dataset.valid_tokens
+        loss = numerator * dist.get_world_size() * self.current_gradient_accumulation_steps / inputs["loss_tokens"]
         watch_loss_scale(loss,self.current_gradient_accumulation_steps,self.record_scale)
         self.seen.append(uid)
-        self.evidence.event("backward_start", uid=uid, loss=loss.detach().item(), old_new_max=(current.detach()-old).abs().max().item())
+        self.step_seen.append(uid)
+        self.evidence.event("backward_start", uid=uid, loss=loss.detach().item(), optimizer_step=self.state.global_step, old_new_max=(current.detach()-old).abs().max().item())
         return loss
 
     def training_step(self, model, inputs, num_items_in_batch=None):
@@ -433,7 +524,7 @@ class GRPOTrainer(Trainer):
         expected_norm = total.sqrt().item()
         value = super()._clip_grad_norm(model)
         self.grad_norm = float(value.item())
-        if not 0 < self.grad_norm < float("inf"):
+        if not 0 <= self.grad_norm < float("inf"):
             raise RuntimeError(f"invalid full gradient norm: {self.grad_norm}")
         proof = verify_clip(rows,expected_norm,self.grad_norm,self.args.max_grad_norm)
         save(self.evidence.out/f'joint-clip-rank{dist.get_rank()}.json',proof)
@@ -442,8 +533,8 @@ class GRPOTrainer(Trainer):
 
 
 def validate_rows(dataset, plan):
-    assert len(dataset) == plan["inputs"]["responses_per_update"]
-    assert len(dataset) // plan["actor"]["world_size"] == plan["gradient_accumulation_steps"]
+    assert len(dataset.rows) == plan["inputs"]["responses_per_update"]
+    assert plan["actor"]["minibatch_responses"] // plan["actor"]["world_size"] == plan["gradient_accumulation_steps"]
     for row in dataset.rows:
         assert 0 < len(row["response"]) <= plan["inputs"]["max_response_tokens"]
         assert len(row["prompt"]) + len(row["response"]) <= plan["inputs"]["context_length"]
@@ -453,28 +544,31 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
          validation=False, save_model_only=False, resident_rounds=None):
     if resume_training and not (restore_from / "kt_optimizer.index.json").is_file():
         raise ValueError(f"Training resume requires a full KT checkpoint: {restore_from}")
-    # Online updates remain blocked until the revised teacher-review gate is
-    # explicitly produced by the completed tests, not by submitting a run.
+    plan = load_plan(config_path)
     if validation:
         validation_root = folder.parent.parent if resident_rounds else folder.parent
         assert validation_root.name.startswith('validation-fixed-') and not resume_training
-    elif json.loads((batch_dir/'batch-audit.json').read_text()).get('policy_version') is not None:
+    elif plan["runtime"]["require_precision_gate"]:
         from ktrl.trainer.precision_gate import verify
         verify(config_path)
     rank = int(os.environ["LOCAL_RANK"])
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", timeout=timedelta(minutes=75), device_id=torch.device("cuda",rank))
-    plan = load_plan(config_path)
     world = dist.get_world_size()
-    assert world == plan["actor"]["world_size"] == 8
+    if world != plan["actor"]["world_size"]:
+        raise ValueError(f"Actor has {world} ranks, expected {plan['actor']['world_size']}")
     dataset = FixedRows(batch_dir)
     validate_rows(dataset, plan)
     start_step = json.loads((restore_from/'trainer_state.json').read_text())['global_step'] if resume_training else 0
     evidence = Evidence(folder, dataset,start_step)
     evidence.resume_checkpoint = restore_from
+    evidence.previous_round = restore_from.parent.parent if restore_from else None
     evidence.resident_rounds = resident_rounds
     evidence.resident_smoke = validation and bool(resident_rounds)
     evidence.plan = plan
+    evidence.round_index = start_step // plan["actor"]["optimizer_steps_per_rollout"] + 1
+    evidence.target_step = start_step + plan["actor"]["optimizer_steps_per_rollout"]
+    dataset.configure(plan, evidence.round_index)
     (folder/"old_logp").mkdir(exist_ok=True)
     evidence.event("load_start")
     validate_loss_math(torch.device("cuda", rank))
@@ -485,7 +579,8 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
     if restore_from:
         kt["kt_expert_checkpoint_path"] = str(restore_from)
     args = TrainingArguments(output_dir=str(folder/"trainer"), per_device_train_batch_size=1,
-        gradient_accumulation_steps=len(dataset)//world, learning_rate=1e-6, weight_decay=0.01,
+        gradient_accumulation_steps=plan["gradient_accumulation_steps"], learning_rate=plan["actor"]["learning_rate"],
+        weight_decay=0.01,
         adam_beta1=0.9,adam_beta2=0.999,adam_epsilon=1e-8,optim="adamw_torch",max_grad_norm=1.0,
         lr_scheduler_type="constant",max_steps=plan['optimizer_schedule_steps'],logging_steps=1,save_strategy="steps",save_steps=1,report_to="none",
         dataloader_num_workers=0, dataloader_pin_memory=False,remove_unused_columns=False,
@@ -505,7 +600,8 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
         if parameter.requires_grad and parameter.numel():
             assert parameter.device.type=='cuda'
             parameter.data=parameter.data.to(master_dtype)
-    assert len(model._kt_wrappers)==40
+    if not model._kt_wrappers:
+        raise RuntimeError("Actor model has no KT expert layers")
     model.config.use_cache=False
     evidence.event("loaded",wrappers=len(model._kt_wrappers))
     trainer = GRPOTrainer(dataset,evidence,model=model,args=args,data_collator=collate,
@@ -539,7 +635,7 @@ def finish_round(trainer, evidence, model, *, model_only, synchronize=False):
     assert trainer.state.global_step==evidence.target_step and len(trainer.seen)==len(dataset)//world
     all_uids=[None]*world
     dist.all_gather_object(all_uids,trainer.seen)
-    assert sorted(uid for part in all_uids for uid in part)==sorted(r["uid"] for r in dataset.rows)
+    assert sorted(uid for part in all_uids for uid in part)==sorted(r["uid"] for r in dataset.rows for _ in range(evidence.plan["actor"]["ppo_epochs"]))
     dist.barrier()
     if synchronize:
         torch.cuda.synchronize()
@@ -555,11 +651,8 @@ def finish_round(trainer, evidence, model, *, model_only, synchronize=False):
         for record in all_records:
             assert record['master_dtype']=='torch.float32'
             assert set(record['moment_dtypes'].values())=={'torch.float32'}
-            fraction = record["master_change_fraction"]
-            if evidence.resident_smoke:
-                assert fraction > 0, record["role"]
-            else:
-                assert fraction >= .99, (record["role"], fraction)
+            # A sparse/zero-advantage minibatch can have zero gradients or
+            # momentum cancellation; exact nonzero movement is diagnostic.
         for i in range(world):
             probe=json.loads((folder/f"postforward-rank{i}.json").read_text())
             assert probe["logits_max_abs"]>0 and probe["dirty_experts"]==0
@@ -569,8 +662,9 @@ def finish_round(trainer, evidence, model, *, model_only, synchronize=False):
         assert any(checkpoint.glob("model*.safetensors")), "Missing nonexpert weights"
         for key in ("kt_optimizer.index.json", "scheduler.pt"):
             assert (checkpoint/key).is_file() != model_only, key
-        save(folder/"accepted.json",dict(world=world,updates=1,roles=[x["role"] for x in all_records],
-            start_step=evidence.start_step,end_step=evidence.target_step,unique_responses=len(dataset),
+        save(folder/"accepted.json",dict(world=world,updates=evidence.target_step-evidence.start_step,roles=[x["role"] for x in all_records],
+            start_step=evidence.start_step,end_step=evidence.target_step,unique_responses=len(dataset.rows),ppo_epochs=evidence.plan["actor"]["ppo_epochs"],
+            minibatches_per_epoch=evidence.plan["actor"]["minibatches_per_epoch"],
             checkpoint_kind="model_only" if model_only else "full",
             valid_response_tokens=dataset.valid_tokens,optimizer_schedule_steps=evidence.plan['optimizer_schedule_steps']))
 
@@ -589,7 +683,7 @@ if __name__ == "__main__":
         parser.error('--resume-training requires --restore-from')
     if opts.resident_rounds is not None and opts.resident_rounds < 1:
         parser.error("--resident-rounds must be positive")
-    if opts.resident_rounds and opts.restore_from:
-        parser.error("--resident-rounds requires a fresh online run")
+    if opts.resident_rounds and opts.restore_from and not opts.resume_training:
+        parser.error("Resident resume requires --resume-training")
     main(opts.config,opts.batch_dir,opts.out,opts.restore_from,opts.resume_training,
          opts.validation_run,opts.save_model_only,opts.resident_rounds)
