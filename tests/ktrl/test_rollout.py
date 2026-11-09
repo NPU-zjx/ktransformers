@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
-from unittest.mock import patch
 
 from ktrl.workers.rollout.sglang.smoke import validate_response, verify_replays, wait_ready
 
@@ -22,10 +21,8 @@ class RolloutEvidenceTest(unittest.TestCase):
                 if path == "/server_info":
                     return expected
 
-        with tempfile.TemporaryDirectory() as folder, patch(
-            "ktrl.workers.rollout.sglang.smoke.state", return_value={"State": {"Running": True}}
-        ):
-            wait_ready(ColdServer(), "cid", expected, Path(folder))
+        with tempfile.TemporaryDirectory() as folder:
+            wait_ready(ColdServer(), lambda: True, expected, Path(folder))
         self.assertEqual(calls, ["/v1/models", "/open_session", "/close_session", "/server_info"])
 
     def test_graph_eligibility_alone_fails(self):

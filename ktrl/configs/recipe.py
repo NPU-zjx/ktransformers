@@ -2,6 +2,8 @@
 
 import json
 import shutil
+import os
+import sys
 from pathlib import Path
 
 import yaml
@@ -39,7 +41,7 @@ def read_model(config, recipe_dir):
         raise ValueError(f"{metadata}: {error}") from error
     architecture = "Qwen3_5MoeForConditionalGeneration"
     if not isinstance(raw, dict) or not isinstance(raw.get("architectures"), list) or architecture not in raw["architectures"]:
-        raise ValueError(f"{metadata}: M0 expects the {architecture} architecture")
+        raise ValueError(f"{metadata}: KTRL currently requires the {architecture} architecture")
     text = raw.get("text_config")
     if not isinstance(text, dict):
         raise ValueError(f"{metadata}: missing text_config")
@@ -61,8 +63,8 @@ def optional_role(config, label):
     if type(enabled) is not bool:
         raise ValueError(f"{label}.enabled must be true or false")
     strategy = require(config.get("strategy", "fsdp2"), f"{label}.strategy", ("fsdp2",))
-    if label == "critic" and enabled:
-        raise ValueError("the Phase 1 GRPO recipe uses no critic")
+    if enabled:
+        raise ValueError(f"{label}.enabled=true is unsupported by KTRL online GRPO")
     return {"enabled": enabled, "strategy": strategy}
 
 
@@ -96,13 +98,50 @@ def profile_windows(preset):
     return {"preset": preset, "planned_windows": windows}
 
 
+def plan_runtime(config, recipe_dir):
+    fields(config, "runtime", ("python", "actor_pythonpath", "rollout_pythonpath", "library_paths",
+                               "cuda_visible_devices", "require_precision_gate", "export_min_free_gib",
+                               "final_probe_tokens"))
+    interpreter = config.get("python", sys.executable)
+    if not isinstance(interpreter, str) or not interpreter.strip():
+        raise ValueError("runtime.python must be a nonempty path")
+    # Keep the venv entry point, which is often a symlink to a base interpreter.
+    python = Path(os.path.abspath(recipe_dir / Path(interpreter).expanduser()))
+    if not python.is_file():
+        raise ValueError(f"runtime.python: missing interpreter {python}")
+    paths = {}
+    for key in ("actor_pythonpath", "rollout_pythonpath", "library_paths"):
+        values = config.get(key, [])
+        if not isinstance(values, list):
+            raise ValueError(f"runtime.{key} must be a list of directories")
+        directories = [path_from(value, f"runtime.{key}", recipe_dir) for value in values]
+        if any(not directory.is_dir() for directory in directories):
+            raise ValueError(f"runtime.{key} contains a missing directory")
+        paths[key] = [str(directory) for directory in directories]
+    inherited_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    devices = config.get("cuda_visible_devices", "" if inherited_devices == "-1" else inherited_devices)
+    if devices is not None and devices != "":
+        parts = devices.split(",") if isinstance(devices, str) else []
+        if (not parts or len(set(parts)) != len(parts)
+                or any(not part.isascii() or not (part.isdecimal() or part.startswith("GPU-"))
+                       for part in parts)):
+            raise ValueError("runtime.cuda_visible_devices must be comma-separated GPU indexes or UUIDs")
+    gate = config.get("require_precision_gate", False)
+    if type(gate) is not bool:
+        raise ValueError("runtime.require_precision_gate must be true or false")
+    return dict(python=str(python), cuda_visible_devices=devices, require_precision_gate=gate,
+                final_probe_tokens=integer(config.get("final_probe_tokens", 32), "runtime.final_probe_tokens", 2),
+                export_min_free_gib=integer(config.get("export_min_free_gib", 0),
+                                            "runtime.export_min_free_gib", 0), **paths)
+
+
 def _read_recipe(config_path):
     path = Path(config_path).resolve()
     try:
         raw = yaml.load(path.read_text(encoding="utf-8"), Loader=RecipeLoader)
     except yaml.YAMLError as error:
         raise ValueError(f"{path}: {error}") from error
-    cfg = fields(raw, "recipe", ("algorithm", "actor_rollout_ref", "expert_placement", "critic", "data", "trainer", "profiling"))
+    cfg = fields(raw, "recipe", ("algorithm", "actor_rollout_ref", "expert_placement", "critic", "data", "trainer", "profiling", "runtime"))
     group = fields(cfg.get("actor_rollout_ref"), "actor_rollout_ref", ("model", "rollout", "actor", "ref"))
     return path, cfg, group
 
@@ -122,8 +161,13 @@ def load_plan(config_path, *, steps=None, profiling=None):
     algorithm = fields(cfg.get("algorithm", {}), "algorithm", ("adv_estimator", "rollout_correction"))
     estimator = require(algorithm.get("adv_estimator", "grpo"), "algorithm.adv_estimator", ("grpo",))
     correction = fields(algorithm.get("rollout_correction", {}), "algorithm.rollout_correction",
-                        ("rollout_is", "rollout_is_threshold"))
+                        ("bypass_mode", "rollout_is", "rollout_is_threshold"))
     rollout_is = require(correction.get("rollout_is"), "algorithm.rollout_correction.rollout_is", (None, "token"))
+    bypass = correction.get("bypass_mode", False)
+    if type(bypass) is not bool:
+        raise ValueError("algorithm.rollout_correction.bypass_mode must be true or false")
+    if bypass and rollout_is is not None:
+        raise ValueError("PPO-clip bypass_mode already uses the rollout ratio; disable rollout_is")
     threshold = correction.get("rollout_is_threshold", 2.0)
     if type(threshold) not in (int, float) or not 0 < threshold < float("inf"):
         raise ValueError("rollout_is_threshold must be finite and positive")
@@ -136,32 +180,47 @@ def load_plan(config_path, *, steps=None, profiling=None):
             raise ValueError(f"missing KT backend source: {REPO / backend['native_source']}")
     ref = optional_role(group.get("ref", {}), "actor_rollout_ref.ref")
     critic = optional_role(cfg.get("critic", {}), "critic")
-    trainer = fields(cfg.get("trainer", {}), "trainer", ("steps", "gradient_accumulation_steps", "optimizer_schedule_steps"))
+    trainer = fields(cfg.get("trainer", {}), "trainer", ("steps", "gradient_accumulation_steps", "optimizer_schedule_steps", "save_freq", "keep_full_checkpoints"))
     num_steps = integer(trainer.get("steps", 1) if steps is None else steps, "trainer.steps")
     inputs = plan_inputs(cfg.get('data', {}),path.parent)
-    gas = integer(trainer.get('gradient_accumulation_steps',4),'trainer.gradient_accumulation_steps')
-    if inputs['responses_per_update'] != actor['world_size']*gas:
-        raise ValueError('responses_per_update must equal actor world_size * GAS (microbatch=1)')
+    mini_prompts = actor["ppo_mini_batch_size"] or inputs["prompts_per_step"]
+    if inputs["prompts_per_step"] % mini_prompts:
+        raise ValueError("prompts_per_step must be divisible by actor.ppo_mini_batch_size")
+    mini_responses = mini_prompts * inputs["responses_per_prompt"]
+    if mini_responses % actor["world_size"]:
+        raise ValueError("PPO minibatch responses must be divisible by Actor world_size")
+    expected_gas = mini_responses // actor["world_size"]
+    gas = integer(trainer.get("gradient_accumulation_steps", expected_gas), "trainer.gradient_accumulation_steps")
+    if gas != expected_gas:
+        raise ValueError("GAS must equal ppo_mini_batch_size * responses_per_prompt / world_size (microbatch=1)")
+    actor["ppo_mini_batch_size"] = mini_prompts
+    actor["minibatch_responses"] = mini_responses
+    actor["minibatches_per_epoch"] = inputs["prompts_per_step"] // mini_prompts
+    actor["optimizer_steps_per_rollout"] = actor["minibatches_per_epoch"] * actor["ppo_epochs"]
     profile = fields(cfg.get("profiling", {}), "profiling", ("preset",))
     preset = require(profile.get("preset", "full") if profiling is None else profiling,
                      "profiling.preset", ("light", "full"))
+    runtime = plan_runtime(cfg.get("runtime", {}), path.parent)
     return {
         "mode": "dry-run",
         "orchestrator": "KTRL",
         "recipe": str(path),
         "algorithm": estimator,
-        "rollout_correction": {"rollout_is": rollout_is, "rollout_is_threshold": threshold},
+        "rollout_correction": {"bypass_mode": bypass, "rollout_is": rollout_is, "rollout_is_threshold": threshold},
+        "runtime": runtime,
         "model": model,
         "expert_placement": placement,
-        "active_roles": ["rollout", "actor"] + (["ref"] if ref["enabled"] else []),
+        "active_roles": ["rollout", "actor"],
         "rollout": rollout,
         "actor": actor,
         "ref": ref,
         "critic": critic,
         "inputs": inputs,
         "gradient_accumulation_steps": gas,
-        "optimizer_schedule_steps": integer(trainer.get('optimizer_schedule_steps',max(418, num_steps)),
-                                            'trainer.optimizer_schedule_steps',num_steps),
+        "optimizer_schedule_steps": integer(trainer.get('optimizer_schedule_steps',max(418, num_steps * actor['optimizer_steps_per_rollout'])),
+                                            'trainer.optimizer_schedule_steps',num_steps * actor['optimizer_steps_per_rollout']),
+        "keep_full_checkpoints": integer(trainer.get("keep_full_checkpoints", 1), "trainer.keep_full_checkpoints"),
+        "save_freq": integer(trainer.get("save_freq", 0), "trainer.save_freq", 0),
         "max_updates": num_steps,
         "profiling": profile_windows(preset),
         "resources": {

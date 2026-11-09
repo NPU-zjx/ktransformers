@@ -38,6 +38,6 @@ def gpu_snapshot(out, label):
     return result
 
 
-def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
+def run(config,out,*,steps=2,final_model_only=False,resident_actor=False,resume_from=None):
     from .online_native import run as execute
-    return execute(config,out,steps=steps,final_model_only=final_model_only,resident_actor=resident_actor)
+    return execute(config,out,steps=steps,final_model_only=final_model_only,resident_actor=resident_actor,resume_from=resume_from)

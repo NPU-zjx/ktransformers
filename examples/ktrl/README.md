@@ -8,4 +8,6 @@
 python3 -B -m ktrl run --config examples/ktrl/qwen36_35b_grpo.yaml --dry-run
 ```
 
-`trainer.steps` 是从训练集消费的批数，CLI 的 `--steps` 可以覆盖它。全量 13,376 行用 1,672 批，另将 `optimizer_schedule_steps` 设为至少 1,672。在线命令、运行环境及验收证据见 [KTRL README](../../ktrl/README.md)。
+`trainer.steps` 是从训练集消费的批数，CLI 的 `--steps` 可以覆盖它。全量 13,376 行用 1,672 批，optimizer_schedule_steps 应至少为批数乘以每批优化器更新次数。在线命令、运行环境及验收证据见 [KTRL README](../../ktrl/README.md)。
+
+actor.ppo_mini_batch_size 默认等于 prompts_per_step，ppo_epochs 默认1。若8题×4答、mini=4、epochs=2，则每轮4次优化器更新，8rank下GAS应为2；若mini=8、epochs=2，则每轮2次更新，GAS仍为4。不要把GAS当作优化器更新次数。

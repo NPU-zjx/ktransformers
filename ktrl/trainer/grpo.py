@@ -24,6 +24,17 @@ def outcome_advantages(groups, rewards, group_size, epsilon=1e-6):
     return advantages
 
 
+def select_old_logp(*, bypass_mode, rollout_logp, targets, recompute):
+    """Select detached old logp on the current device, preserving token order."""
+    import torch
+
+    old = rollout_logp if bypass_mode else recompute()
+    source = "rollout" if bypass_mode else "Actor"
+    if old.shape != targets.shape or not old.numel() or not torch.isfinite(old).all():
+        raise ValueError(f"{source} old logp must contain one finite value per response token")
+    return old.detach().to(device=targets.device, dtype=torch.float32)
+
+
 def token_tis_weights(old_logp, rollout_logp, threshold):
     """veRL decoupled token TIS: a detached weight for rollout-to-Actor drift."""
     import torch

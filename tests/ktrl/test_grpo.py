@@ -1,6 +1,6 @@
 import unittest
 
-from ktrl.trainer.grpo import outcome_advantages, policy_loss_sum, token_tis_weights
+from ktrl.trainer.grpo import outcome_advantages, policy_loss_sum, select_old_logp, token_tis_weights
 
 
 class AdvantageTest(unittest.TestCase):
@@ -32,3 +32,35 @@ class AdvantageTest(unittest.TestCase):
         self.assertIsNone(rollout.grad)
         with self.assertRaises(ValueError):
             token_tis_weights(old, rollout[:0], 2.0)
+
+    def test_policy_clip_and_dual_clip_have_the_expected_gradients(self):
+        import torch
+
+        current = torch.tensor([1.5, 0.5, 4.0, 1.1]).log().requires_grad_()
+        old = torch.zeros_like(current)
+        advantage = torch.tensor([1.0, -1.0, -1.0, 1.0])
+        loss = policy_loss_sum(current, old, advantage, torch.ones_like(current, dtype=torch.bool))
+        torch.testing.assert_close(loss, torch.tensor(-1.28 + 0.8 + 3.0 - 1.1))
+        loss.backward()
+        torch.testing.assert_close(current.grad, torch.tensor([0.0, 0.0, 0.0, -1.1]))
+
+    def test_bypass_uses_rollout_ratio_without_actor_recompute(self):
+        import torch
+        from unittest.mock import Mock
+
+        current = torch.tensor([-0.5], requires_grad=True)
+        rollout = torch.tensor([-0.6], requires_grad=True)
+        targets = torch.tensor([42])
+        recompute = Mock(return_value=current.detach().clone())
+        old = select_old_logp(bypass_mode=True, rollout_logp=rollout, targets=targets, recompute=recompute)
+        recompute.assert_not_called()
+        loss = policy_loss_sum(current, old, torch.tensor(1.0), torch.tensor([True]))
+        torch.testing.assert_close(loss, -torch.tensor(0.1).exp())
+        loss.backward()
+        self.assertIsNone(rollout.grad)
+        old = select_old_logp(bypass_mode=False, rollout_logp=rollout, targets=targets, recompute=recompute)
+        recompute.assert_called_once_with()
+        torch.testing.assert_close(old, current.detach())
+        for invalid in (rollout[:0], torch.tensor([float("nan")])):
+            with self.assertRaisesRegex(ValueError, "rollout old logp"):
+                select_old_logp(bypass_mode=True, rollout_logp=invalid, targets=targets, recompute=recompute)

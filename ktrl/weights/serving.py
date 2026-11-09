@@ -64,11 +64,29 @@ def install():
     original_replay = CudaGraphRunner.replay
     counts = {}
 
+    def flush_replay_counts():
+        # Avoid synchronous filesystem I/O on every decode. Atomic replacement
+        # also prevents readers observing a partially truncated JSON document.
+        target = root / f"replays-rank{dist.get_rank()}.json"
+        temporary = target.with_suffix(".tmp")
+        temporary.write_text(json.dumps(counts))
+        temporary.replace(target)
+
+    if os.environ.get("KTRL_ONLINE_PHASES") == "1":
+        import phase_hooks
+        original_phase_end = phase_hooks.end
+        def phase_end():
+            result = original_phase_end()
+            flush_replay_counts()
+            return result
+        phase_hooks.end = phase_end
+
     def replay(self, *args, **kwargs):
         result = original_replay(self, *args, **kwargs)
         label = version["value"]
         counts[label] = counts.get(label, 0) + 1
-        (root / f"replays-rank{dist.get_rank()}.json").write_text(json.dumps(counts))
+        if counts[label] == 1:
+            flush_replay_counts()
         return result
 
     CudaGraphRunner.replay = replay
@@ -94,6 +112,7 @@ def install():
     LogitsProcessor.forward = logits
 
     def update(self, model_path, load_format, weight_name_filter=None, recapture_cuda_graph=False):
+        flush_replay_counts()
         path = Path(model_path)
         error=None
         try:
@@ -127,7 +146,9 @@ def install():
             torch.cuda.synchronize()
             methods = [(module, module.quant_method) for module in self.model.modules()
                        if type(getattr(module, "quant_method", None)).__name__ == "KTEPWrapperMethod"]
-            assert len(methods) == 40
+            native_layers = {str(method.kt_config.layer_idx) for _, method in methods}
+            if native_layers != set(index.index["layers"]) or len(native_layers) != len(methods):
+                raise ValueError("Published CPU expert layers do not match the rollout model")
             NativeMoEWrapper.force_release_loader()
             for module, method in methods:
                 assert int(module.w13_weight.shape[0]) == 0
@@ -152,16 +173,19 @@ def install():
                 fault=json.loads(injection.read_text())
                 if fault.get('rank')==dist.get_rank() and fault.get('stage')=='after_gpu_load':
                     raise RuntimeError('Explicit publication fault injection after GPU load')
+            first_layer = min(map(int, native_layers))
+            router_suffix = f"layers.{first_layer}.mlp.gate.weight"
             router_name, router = next((name, param) for name, param in self.model.named_parameters()
-                                      if name.endswith("layers.0.mlp.gate.weight"))
-            router_value = router.detach().reshape(-1)[64].item()
+                                      if name.endswith(router_suffix))
+            router_sample = min(64, router.numel() - 1)
+            router_value = router.detach().reshape(-1)[router_sample].item()
             expected_router = None
             for file in sorted(path.glob('model*.safetensors')):
                 with safe_open(file,framework='pt',device='cpu') as source:
-                    keys=[name for name in source.keys() if name.endswith('layers.0.mlp.gate.weight')]
+                    keys=[name for name in source.keys() if name.endswith(router_suffix)]
                     if keys:
                         assert expected_router is None and len(keys)==1
-                        expected_router=source.get_tensor(keys[0]).reshape(-1)[64].to(router.dtype).item()
+                        expected_router=source.get_tensor(keys[0]).reshape(-1)[router_sample].to(router.dtype).item()
             assert expected_router is not None
             assert router_value == expected_router
             for module, method in methods:
@@ -173,8 +197,8 @@ def install():
             dist.barrier()
             rank = dist.get_rank()
             proof = {
-                "rank": rank, "version": str(path), "cpu_expert_layers": 40 if rank == 0 else 0,
-                "router_name": router_name, "router_flat_index": 64,
+                "rank": rank, "version": str(path), "cpu_expert_layers": len(methods) if rank == 0 else 0,
+                "router_name": router_name, "router_flat_index": router_sample,
                 "router_value": router_value, "checkpoint_router_value": expected_router,
                 "expert_gpu_staging_bytes": 0, "nonexpert_tensors": loaded,
                 "graph_recaptured": True, "policy_version":label, "actor_step":step,

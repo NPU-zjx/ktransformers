@@ -7,16 +7,27 @@ def plan_actor(config, placement):
     label = "actor_rollout_ref.actor"
     fields(config, label, (
         "strategy", "world_size", "training_scope", "kt_num_gpu_experts",
-        "kt_num_threads", "kt_threadpool_count", "nonexpert_parameter_dtype",
+        "kt_num_threads", "kt_threadpool_count", "nonexpert_parameter_dtype", "learning_rate", "ppo_mini_batch_size", "ppo_epochs", "shuffle", "data_loader_seed",
     ))
     strategy = require(config.get("strategy", "fsdp2"), f"{label}.strategy", ("fsdp2",))
     scope = require(config.get("training_scope", "full"), f"{label}.training_scope", ("full",))
     pools = integer(config.get("kt_threadpool_count", 1), f"{label}.kt_threadpool_count")
+    learning_rate = config.get("learning_rate", 1e-6)
+    if type(learning_rate) not in (int, float) or not 0 < learning_rate < float("inf"):
+        raise ValueError(f"{label}.learning_rate must be finite and positive")
+    if type(config.get("shuffle", False)) is not bool:
+        raise ValueError(f"{label}.shuffle must be boolean")
     return {
+        "ppo_mini_batch_size": (integer(config["ppo_mini_batch_size"], f"{label}.ppo_mini_batch_size")
+                                if "ppo_mini_batch_size" in config else None),
+        "ppo_epochs": integer(config.get("ppo_epochs", 1), f"{label}.ppo_epochs"),
+        "shuffle": config.get("shuffle", False),
+        "data_loader_seed": integer(config.get("data_loader_seed", 42), f"{label}.data_loader_seed", 0),
         "backend": "HF/FSDP2 + KT SFT",
         "strategy": strategy,
         "world_size": integer(config.get("world_size", 1), f"{label}.world_size"),
         "training_scope": scope,
+        "learning_rate": learning_rate,
         "nonexpert_parameter_dtype": require(config.get('nonexpert_parameter_dtype','float32'),
             f'{label}.nonexpert_parameter_dtype',('float32',)),
         'mixed_precision_policy':{'param_dtype':'bfloat16','reduce_dtype':'float32'},

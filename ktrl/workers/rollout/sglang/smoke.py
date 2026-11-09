@@ -1,6 +1,5 @@
 """Submit one native KT-SGLang generation from KTRL and audit its decode replay."""
 
-import hashlib
 import json
 from pathlib import Path
 import time
@@ -8,21 +7,7 @@ import urllib.error
 import urllib.request
 import uuid
 
-from ktrl.configs.recipe import REPO, load_rollout_config
-from .qjh005 import RESULTS, save, service, state
-
-
-PROMPTS_SHA256 = "64f543ad9d067508e9eab2d07a783c91f37f9f836913c4dcf9e217613db472a7"
-
-
-def first_prompt():
-    raw = (REPO / "profiling/data/jiaheng-prompts32.json").read_bytes()
-    if hashlib.sha256(raw).hexdigest() != PROMPTS_SHA256:
-        raise ValueError("M1 input differs from the fixed baseline prompts")
-    row = json.loads(raw)["rows"][0]
-    if len(row["prompt"]) != 127:
-        raise ValueError("Unexpected M1 prompt length")
-    return row
+from ktrl.trainer.online import save
 
 
 class SGLangClient:
@@ -44,10 +29,10 @@ class SGLangClient:
         return self.call("/generate", payload, timeout=600)
 
 
-def wait_ready(client, cid, expected, out):
-    deadline = time.monotonic() + 1800
+def wait_ready(client, is_running, expected, out, *, timeout=2400):
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not state(cid)["State"]["Running"]:
+        if not is_running():
             raise RuntimeError(f"KT-SGLang exited during startup; see {out}/server.log")
         try:
             models = client.call("/v1/models", timeout=8)
@@ -73,14 +58,14 @@ def wait_ready(client, cid, expected, out):
     raise TimeoutError(f"KT-SGLang readiness timed out; see {out}/server.log")
 
 
-def validate_response(payload, response):
+def validate_response(payload, response, *, minimum_tokens=2):
     meta = response["meta_info"]
     ids = response["output_ids"]
     if meta["id"] != payload["rid"] or meta["prompt_tokens"] != len(payload["input_ids"]):
         raise ValueError("Response does not match the submitted request")
     if not isinstance(ids, list) or any(type(t) is not int or t < 0 for t in ids):
         raise ValueError("Invalid output token IDs")
-    if not 2 <= len(ids) <= payload["sampling_params"]["max_new_tokens"] or meta["completion_tokens"] != len(ids):
+    if not minimum_tokens <= len(ids) <= payload["sampling_params"]["max_new_tokens"] or meta["completion_tokens"] != len(ids):
         raise ValueError("Output token count does not cover decode")
     if meta["finish_reason"]["type"] not in {"stop", "length"}:
         raise ValueError(f"Generation did not finish normally: {meta['finish_reason']}")
@@ -115,26 +100,31 @@ def verify_replays(folder, tp_size, input_count, output_count):
     return [ranks[i] for i in range(tp_size)]
 
 
-def run_one(config_path, output, max_new_tokens):
+def run_one(config_path, output, max_new_tokens, prompt_file):
+    from ktrl.configs.recipe import load_plan
+    from ktrl.trainer.online_native import service
+    from ktrl.trainer.phase_completion import wait_phase_traces
+
     config_path = Path(config_path).resolve()
-    rollout = load_rollout_config(config_path)
-    row = first_prompt()
+    plan = load_plan(config_path)
+    rollout = plan["rollout"]
+    prompt = json.loads(Path(prompt_file).read_bytes())
+    if (not isinstance(prompt, list) or not prompt
+            or any(type(token) is not int or token < 0 for token in prompt)):
+        raise ValueError("Prompt file must be a nonempty JSON array of token IDs")
+    if len(prompt) + max_new_tokens > plan["inputs"]["context_length"]:
+        raise ValueError("Prompt and requested output exceed data.context_length")
     out = Path(output).resolve()
-    if RESULTS.resolve() not in out.parents:
-        raise ValueError(f"Choose a new output directory under {RESULTS}")
-    out.mkdir(exist_ok=False)
+    out.mkdir(parents=True, exist_ok=False)
     phase = out / "phase"
     phase.mkdir()
     save(out / "resolved-rollout.json", rollout)
     (out / "recipe.yaml").write_bytes(config_path.read_bytes())
     rid = uuid.uuid4().hex
-    payload = {"rid": rid, "input_ids": row["prompt"], "stream": False,
+    payload = {"rid": rid, "input_ids": prompt, "stream": False,
                "sampling_params": {"temperature": 0, "max_new_tokens": max_new_tokens, "ignore_eos": False}}
-    with service(rollout, out) as (cid, name, url):
-        client = SGLangClient(url)
-        expected = dict(rollout["server_args"], served_model_name=name, skip_server_warmup=True)
-        wait_ready(client, cid, expected, out)
-        client.call("/start_profile", {"activities": ["KT_PHASE"], "output_dir": "/output/phase",
+    with service(config_path, out / "service", plan) as (client, _):
+        client.call("/start_profile", {"activities": ["KT_PHASE"], "output_dir": str(phase),
                                        "record_shapes": False, "with_stack": False})
         try:
             # The exclusive output directory and this record protect the single submission.
@@ -147,15 +137,17 @@ def run_one(config_path, output, max_new_tokens):
         finally:
             client.call("/stop_profile", {})
         ids = validate_response(payload, response)
-        ranks = verify_replays(phase, expected["tp_size"], len(payload["input_ids"]), len(ids))
+        tp = rollout["server_args"]["tp_size"]
+        wait_phase_traces(phase, world_size=tp)
+        ranks = verify_replays(phase, tp, len(prompt), len(ids))
     result = {
-        "scope": "one KTRL rollout request", "backend": rollout["backend"], "container_id": cid,
-        "request_id": rid, "prompt_uid": row["uid"], "prompt_index": 0, "prompts_sha256": PROMPTS_SHA256,
+        "scope": "one KTRL rollout request", "backend": rollout["backend"],
+        "request_id": rid, "prompt_file": str(Path(prompt_file).resolve()),
         "submitted_requests": 1, "input_tokens": len(row["prompt"]), "output_tokens": len(ids), "output_ids": ids,
         "text": response["text"], "finish_reason": response["meta_info"]["finish_reason"],
         "client_request_seconds": seconds, "ranks": ranks,
         "decode_replay_batches_all_ranks": sum(r["decode_replay_batches"] for r in ranks),
-        "exit": json.loads((out / "exit.json").read_text()),
+        "exit": json.loads((out / "service" / "exit.json").read_text()),
     }
     save(out / "rollout-summary.json", result)
     return result

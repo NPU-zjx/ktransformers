@@ -59,11 +59,16 @@ def score(out, model):
     tok = AutoTokenizer.from_pretrained(model, local_files_only=True)
     prompts = json.loads((out/'prompts.json').read_bytes())
     recipe = json.loads((out/'round.json').read_text())
+    correction = recipe.get("rollout_correction", {})
+    old_logp_source = "rollout" if correction.get("bypass_mode") else "actor"
     maximum = recipe['max_response_tokens']
     buffer = recipe['overlong_buffer_tokens']
+    answers = recipe["responses_per_prompt"]
+    if len(prompts) != recipe["prompts_per_step"]:
+        raise ValueError("Prompt count differs from the resolved recipe")
     rows, details = [], []
     started = time.time_ns()
-    for wave in range(4):
+    for wave in range(answers):
         for index, question in enumerate(prompts):
             uid = f'm4-w{wave}-q{index:02d}'
             result = json.loads((out/'rollout'/f'{uid}.json').read_bytes())
@@ -85,7 +90,7 @@ def score(out, model):
             details.append(dict(uid=uid, **base, overlong_reward=penalty, reward=reward,
                                 response_tokens=len(response), ground_truth=question['ground_truth']))
     reward_end = time.time_ns()
-    adv = outcome_advantages([r['group'] for r in rows], [r['reward'] for r in rows], 4)
+    adv = outcome_advantages([r['group'] for r in rows], [r['reward'] for r in rows], answers)
     groups = defaultdict(list)
     for row, value in zip(rows, adv):
         row['advantage'] = value
@@ -95,9 +100,9 @@ def score(out, model):
     zero_tokens=0
     identical_groups=0
     for group in groups.values():
-        assert len(group) == 4
-        mean = math.fsum(r['reward'] for r in group)/4
-        std = math.sqrt(math.fsum((r['reward']-mean)**2 for r in group)/3)
+        assert len(group) == answers
+        mean = math.fsum(r['reward'] for r in group)/answers
+        std = math.sqrt(math.fsum((r['reward']-mean)**2 for r in group)/(answers-1))
         for row in group:
             expected = (row['reward']-mean)/(std+1e-6)
             max_error = max(max_error, abs(expected-row['advantage']))
@@ -112,7 +117,7 @@ def score(out, model):
     batch.mkdir()
     write(batch/'fixed-rows.json', rows)
     write(batch/'rewards.json', details)
-    assert len(rows)==32 and len(prompts)==8
+    assert len(rows)==recipe["responses_per_update"]
     write(batch/'batch-audit.json', dict(records=len(rows), questions=len(prompts),
           fixed_sha256=hashlib.sha256((batch/'fixed-rows.json').read_bytes()).hexdigest(),
           valid_response_tokens=sum(len(r['response']) for r in rows),
@@ -121,11 +126,11 @@ def score(out, model):
           zero_advantage_groups=zero_groups,zero_advantage_tokens=zero_tokens,
           zero_advantage_token_fraction=zero_tokens/sum(len(r['response']) for r in rows),
           identical_answer_groups=identical_groups,filter_groups=False,
-          rollout_importance_sampling=recipe.get("rollout_correction", {}).get("rollout_is"),
+          rollout_importance_sampling=correction.get("rollout_is"), old_logp_source=old_logp_source,
           advantage_reference_max_error=max_error,
           score_histogram=dict(Counter(str(r['score']) for r in details)),
           reward_interval_ns=[started,reward_end], advantage_interval_ns=[reward_end,advantage_end],
-          provenance='Live KT-SGLang output IDs including actual EOS; no text re-encoding. Actor recomputes old probabilities before its sole update.',
+          provenance='Live KT-SGLang output IDs including actual EOS; no text re-encoding.',
           policy_version=recipe['policy_version'],
           reward_recipe=f'math_dapo score +/-1; overlong buffer={buffer}; maximum={maximum}'))
 

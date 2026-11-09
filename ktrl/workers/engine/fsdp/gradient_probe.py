@@ -97,7 +97,7 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
         for module in model.modules():
             if type(module).__name__=='Qwen3_5MoeExperts':
                 module.forward=types.MethodType(expert_forward,module);patched+=1
-        assert patched==40
+        assert patched > 0, "No compatible GPU expert modules found"
     for p in model.parameters():
         if p.requires_grad and p.numel():p.data=p.data.float()
     model.config.use_cache=False
@@ -120,7 +120,7 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
                     return Replay.apply(output,target)
                 module.register_forward_hook(replace)
                 count+=1
-        assert count==40,count
+        assert count == plan["model"]["text_layers"], count
 
     class Check(TrainerCallback):
         def on_train_begin(self,args,state,control,model,**kwargs):

@@ -6,7 +6,7 @@ expert_placement:
   gpu_experts_per_layer: 0
 actor_rollout_ref:
   model:
-    path: /mnt/qjh007/models/Qwen3.6-35B-A3B
+    path: /path/to/Qwen3.6-35B-A3B
     dtype: bfloat16
   rollout:
     name: sglang
@@ -28,7 +28,7 @@ critic:
   enabled: false
   strategy: fsdp2
 data:
-  train_file: /raid/data/zjx/gpu-baseline/data/full20k-20261025/train-13376.parquet
+  train_file: /path/to/train.parquet
   prompts_per_step: 8
   responses_per_prompt: 4
   max_response_tokens: 8192
@@ -41,4 +41,4 @@ trainer:
   gradient_accumulation_steps: 4
   optimizer_schedule_steps: 418
 profiling:
-  preset: full
+  preset: light

@@ -53,6 +53,26 @@ class DryRunTest(unittest.TestCase):
             cwd=ROOT, capture_output=True, text=True, check=False,
         )
 
+    def test_verl_minibatch_epoch_plan_and_gas_validation(self):
+        actor = self.config["actor_rollout_ref"]["actor"]
+        actor.update(ppo_mini_batch_size=4, ppo_epochs=2)
+        self.config["trainer"]["gradient_accumulation_steps"] = 2
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["actor"]["minibatch_responses"], 16)
+        self.assertEqual(plan["actor"]["optimizer_steps_per_rollout"], 4)
+        self.config["trainer"]["gradient_accumulation_steps"] = 4
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("GAS must equal", result.stderr)
+
+    def test_incomplete_ppo_minibatch_fails_before_runtime(self):
+        self.config["actor_rollout_ref"]["actor"]["ppo_mini_batch_size"] = 3
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("divisible", result.stderr)
+
     def test_optional_rollout_correction(self):
         result = self.invoke("--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -61,11 +81,21 @@ class DryRunTest(unittest.TestCase):
         result = self.invoke("--dry-run")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["rollout_correction"],
-                         {"rollout_is": "token", "rollout_is_threshold": 1.5})
+                         {"bypass_mode": False, "rollout_is": "token", "rollout_is_threshold": 1.5})
         self.config["algorithm"]["rollout_correction"]["rollout_is_threshold"] = -1
         result = self.invoke("--dry-run")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("finite and positive", result.stderr)
+
+    def test_rollout_bypass_configuration(self):
+        self.config["algorithm"]["rollout_correction"] = {"bypass_mode": True}
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)["rollout_correction"]["bypass_mode"])
+        self.config["algorithm"]["rollout_correction"]["rollout_is"] = "token"
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("disable rollout_is", result.stderr)
 
     def test_shared_placement_and_cli_overrides(self):
         result = self.invoke("--dry-run", "--steps", "2", "--profiling", "light")
@@ -98,7 +128,10 @@ class DryRunTest(unittest.TestCase):
             group[name]["kt_num_gpu_experts"] = 0
         self.assertEqual(self.invoke("--dry-run").returncode, 0)
         group["rollout"]["kt_num_gpu_experts"] = 32
-        for command, flags in (("run", ["--dry-run"]), ("rollout", ["--output-dir", str(self.folder / "unused")])):
+        for command, flags in (
+            ("run", ["--dry-run"]),
+            ("rollout", ["--output-dir", str(self.folder / "unused"), "--prompt-file", str(self.folder / "prompt.json")]),
+        ):
             result = self.invoke(*flags, command=command)
             self.assertEqual(result.returncode, 2, result.stderr)
             self.assertIn("same expert placement", result.stderr)
@@ -143,8 +176,14 @@ class DryRunTest(unittest.TestCase):
     def test_execution_requires_profiling_and_output(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 2)
-        self.assertIn("Online execution requires --profiling light --output-dir", result.stderr)
+        self.assertIn("Online execution requires --output-dir", result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_rejects_unimplemented_reference_role(self):
+        self.config["actor_rollout_ref"]["ref"]["enabled"] = True
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("ref.enabled=true is unsupported", result.stderr)
 
     def test_full_dataset_update_count(self):
         del self.config["trainer"]["optimizer_schedule_steps"]
@@ -154,3 +193,24 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(plan["max_updates"], 1672)
         self.assertEqual(plan["optimizer_schedule_steps"], 1672)
         self.assertEqual(plan["inputs"]["responses_per_update"], 32)
+
+    def test_non_baseline_runtime_and_batch_shape(self):
+        roles = self.config["actor_rollout_ref"]
+        roles["actor"].update(world_size=2, learning_rate=0.000003)
+        roles["rollout"].update(tp_size=1, mem_fraction_static=0.5)
+        self.config["trainer"]["gradient_accumulation_steps"] = 3
+        self.config["data"].update(prompts_per_step=2, responses_per_prompt=3,
+                                   max_response_tokens=17, max_prompt_tokens=32, context_length=64,
+                                   overlong_buffer_tokens=4)
+        self.config["runtime"] = {"python": sys.executable, "actor_pythonpath": ["model"],
+                                  "cuda_visible_devices": "3,5"}
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["runtime"]["actor_pythonpath"], [str(self.folder / "model")])
+        self.assertFalse(plan["runtime"]["require_precision_gate"])
+        self.assertEqual(plan["runtime"]["cuda_visible_devices"], "3,5")
+        self.assertEqual(plan["actor"]["world_size"], 2)
+        self.assertEqual(plan["rollout"]["server_args"]["tp_size"], 1)
+        self.assertEqual(plan["inputs"]["responses_per_update"], 6)
+        self.assertEqual(plan["inputs"]["max_response_tokens"], 17)
