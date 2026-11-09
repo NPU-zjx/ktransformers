@@ -1,31 +1,37 @@
 # KTRL
 
-KTRL 在 KT 已有的推理和微调能力上组织 RL。后续同步 GRPO 由 KTRL 调用 rollout 生成回答，计算奖励和优势，调 Actor 更新，再将新策略发布给 rollout。veRL 仓库用于阅读目录组织和接口设计。配置、请求、调度及权重发布均属于 KTRL。
+KTRL 在 KT 原生推理和微调能力上实现同步在线 GRPO。`ktrl run` 由同一个控制器驱动 KT-SGLang rollout、奖励和优势计算、FSDP2 Actor 更新及权重发布。005 已验收常驻 Actor 的两个完整在线训练步。
 
-## M0 配置预览
+## 两轮如何自动接续
 
-在仓库根目录执行以下命令。环境需要 Python 3.10+ 和 PyYAML。
+1. [在线控制器](trainer/online_native.py) 从 base 策略 `v0` 启动 KT-SGLang TP8，每轮按 8 题 × 4 答请求现场生成。两轮复用同一组题目，每轮回答均由当轮策略重新生成。
+2. [批次构造](trainer/online_batch.py) 直接读取服务返回的回答 token ID，计算数学奖励和组内 GRPO 优势。固定回答回放属于独立的 Actor 验证入口。
+3. 控制器等 rollout 排空并释放其显存，再把当轮批次交给 [FSDP2 Actor](workers/engine/fsdp/actor_update.py)。Actor 在更新前计算 old logp，按 GAS4 完成反向、CPU/GPU 联合梯度裁剪和一次 AdamW 更新。常驻模式在同一次 Trainer 调用中保留八个 rank、模型、优化器和调度器，等待下一批。
+4. Actor 每步仅导出模型权重。控制器恢复 rollout，通过[权重发布](weights/serving.py)将 CPU 专家直接加载到 CPU，并由原生 TP 加载器更新 GPU 参数。发布核对权重清单和八个 rank 的版本，重捕获 CUDA Graph。第二轮用 `v1` 生成完整训练批次并执行 step 2，发布 `v2` 后再做一次生成验证。
+
+训练和推理共用逐层专家放置。已验收配方的路由专家全部留在 CPU，发布时 GPU 中转字节为 0。常驻模式每步磁盘导出约 70.86 GiB，用于推理发布。需要在进程退出后续训时，需另行保存完整训练 checkpoint。
+
+## 入口与环境
+
+从仓库根目录运行配置预览（Python 3.10+、PyYAML，模型和数据路径按实际环境配置）。
 
 ```bash
-./bin/ktrl run --config examples/ktrl/qwen36_35b_grpo.yaml --dry-run
+python3 -B -m ktrl run --config examples/ktrl/qwen36_35b_grpo.yaml --dry-run
 ```
 
-也可以使用 `python3 -B -m ktrl run --config examples/ktrl/qwen36_35b_grpo.yaml --dry-run`。CLI 输出 JSON，读取 YAML 和 HF 的 `config.json`，检查模型目录、后端源码入口和已指定的数据路径。相对路径按 YAML 所在目录解析。此入口只解析配置；模型加载、服务、训练和 profiler 的执行属于后续里程碑。
+005 验收使用 Qwen3.6-35B-A3B、八卡、8192 回答 token 上限、GAS4 和 [35B 配方](../examples/ktrl/qwen36_35b_grpo.yaml)。以下是该实验环境的入口。`RECIPE` 指向通过验收的配方，旁边须有 `precision-gate.json` 和它引用的已有证据。门槛会核对配方、源码和证据哈希。环境还依赖原生 KT Actor 和 KT-SGLang Python 环境、SGLang 子模块、模型及数据挂载。宿主限制和环境路径见 [online_native.py](trainer/online_native.py)。
 
-| 位置 | 职责 |
-|---|---|
-| `configs/recipe.py` | 解析 KTRL 配方，检查角色、输入、步数和诊断窗口。 |
-| [rollout/sglang](workers/rollout/sglang/README.md) | 将 KTRL 生成配置映射为 KT-SGLang 参数。后续接收来自 KTRL 的 prompt 和采样设置，返回生成结果。 |
-| [engine/fsdp](workers/engine/fsdp/README.md) | 解析 HF/FSDP2 Actor 和 KT SFT 参数。后续接收 KTRL 训练批次并更新专家和 GPU 参数。 |
-| `weights/` | 后续组织 Actor 导出、分片映射、权重发布和各 rank 确认。 |
-| [examples/ktrl](../examples/ktrl/README.md)、[tests/ktrl](../tests/ktrl/README.md) | 35B 配置示例与离线回归测试。 |
+```bash
+export KTRL_RUN_ROOT=/raid/data/zjx/kt-baseline/checks/ktrl-review-005-20261108
+RECIPE="$KTRL_RUN_ROOT/resident-a04/recipe.yaml"
+python3 -B -m ktrl run --config "$RECIPE" --steps 2 --profiling light \
+  --resident-actor --output-dir "$KTRL_RUN_ROOT/rl-<fresh-run-name>"
+```
 
-`expert_placement` 是 Actor 与 rollout 共同使用的专家放置策略。每个 MoE 层的同一 expert ID 在两端分配到相同设备类型；旧配置字段相互冲突时，两个入口均在启动服务前报错。当前 Full Actor 选用的 KT 路径要求路由专家驻留 CPU，默认每层 ID 0–255 在 CPU。推理禁用动态专家迁移和临时整层 GPU prefill。这样发布时可以按相同归属发送更新。进程间仍需同步新版参数，后续按方向统计专家权重、激活及梯度字节，并验收 CPU 专家权重不逐层往返 GPU。[KT-FT 图 1](../papers/kt-ft/ktransformers-finetune.pdf)
+## 005 验收结果
 
-## M1 单请求 rollout
+2026-11-09，`rl-resident-a04` 控制器退出 0，两轮在线优化器更新为 `[1, 2]`。第二轮生成用 `v1`，八个 Actor rank 与优化器对象跨轮保持一致，第二轮反向前 204 个参数和优化器状态抽样位置逐值一致。最终用 `v2` 生成 32 token，八个 rollout rank 均有实际 CUDA Graph 回放。两轮端到端约 73 分 32 秒。
 
-在 qjh005 上使用新的输出目录运行 `./bin/ktrl rollout --config examples/ktrl/qwen36_35b_grpo.yaml --output-dir /raid/data/zjx/kt-baseline/results/<新运行名>`。这个命令启动专用 KT-SGLang 容器，跳过 HTTP 热身，通过 KTRL 提交一条生成请求，收集各 TP rank 的 Graph replay，然后停止本次容器。它只解析模型和 rollout 配置。结果见 `request.json`、`response.json`、`phase/`、`exit.json` 和 `rollout-summary.json`。
+证据位于 005 上的 `rl-resident-a04`。根目录 `accepted.json` 记录最终验收，`round-*/accepted.json` 和 `round-*/stages.jsonl` 记录逐轮版本与耗时，`round-*/actor/` 保存优化器和跨轮检查，`service/` 保存逐 rank 发布和回放证据，`resources.jsonl` 保存显存采样。
 
-## M2 固定批次 Actor 更新
-
-`trainer/fixed_batch.py` 从已有回答和奖励构造同题多答批次，`trainer/grpo.py` 计算组内优势和按有效回答 token 聚合的策略损失。Actor 用初始模型重算旧概率，再调用 KT 原生微调路径。固定批次、两卡单层对照、八卡更新和独立 checkpoint 恢复分别有单独入口与输出目录。[qjh005 运行方法](../examples/ktrl/README.md)
+当前验收范围是两轮工程闭环。训推 logp 偏差仍单独记录，学习效果和长期数据迭代仍待验证。离线回归入口见 [tests/ktrl](../tests/ktrl/README.md)。

@@ -71,7 +71,10 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(plan["actor"]["expert_placement"]["cpu"]["count"], 256)
         self.assertEqual(plan["max_updates"], 2)
         self.assertEqual(plan["profiling"]["preset"], "light")
-        self.assertEqual(plan["inputs"]["responses_per_update"], 128)
+        self.assertEqual(plan["inputs"]["responses_per_update"], 32)
+        self.assertEqual(plan['gradient_accumulation_steps'],4)
+        self.assertEqual(plan['inputs']['max_response_tokens'],8192)
+        self.assertEqual(plan['inputs']['context_length'],9216)
         self.assertEqual(plan["model"]["path"], str(self.folder / "model"))
 
     def test_legacy_recipe_and_mismatch_before_any_generation(self):
@@ -123,8 +126,8 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("config.json", result.stderr)
 
-    def test_execution_is_unavailable(self):
+    def test_execution_requires_explicit_single_step_and_output(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 2)
-        self.assertIn("--dry-run only", result.stderr)
+        self.assertIn("M4 execution requires --steps 1 or 2 --profiling light --output-dir", result.stderr)
         self.assertEqual(result.stdout, "")

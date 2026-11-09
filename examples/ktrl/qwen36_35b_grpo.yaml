@@ -18,6 +18,7 @@ actor_rollout_ref:
     strategy: fsdp2
     world_size: 8
     training_scope: full
+    nonexpert_parameter_dtype: float32  # Match native SFT pure_bf16=false; KT experts remain BF16.
     kt_num_threads: 48
     kt_threadpool_count: 1
   ref:
@@ -28,9 +29,16 @@ critic:
   strategy: fsdp2
 data:
   train_file: /raid/data/zjx/gpu-baseline/data/full20k-20261025/train-13376.parquet
-  prompts_per_step: 32
+  prompts_per_step: 8
   responses_per_prompt: 4
+  max_response_tokens: 8192
+  max_prompt_tokens: 1024
+  context_length: 9216
+  seed: 42
+  overlong_buffer_tokens: 256  # Frozen original GPU RL recipe; maximum is 8192.
 trainer:
-  steps: 1
+  steps: 2
+  gradient_accumulation_steps: 4
+  optimizer_schedule_steps: 418
 profiling:
   preset: full
