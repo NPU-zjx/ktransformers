@@ -16,7 +16,7 @@ from kt_kernel.sft import get_kt_named_trainable_params, get_kt_rank_local_param
 from kt_kernel.sft.profiler import collect_kt_sft_profile
 
 from ktrl.configs.recipe import load_plan
-from ktrl.trainer.grpo import policy_loss_sum
+from ktrl.trainer.grpo import policy_loss_sum, token_tis_weights
 from ktrl.trainer.gradient_audit import watch_loss_scale, gradient_snapshot, verify_clip
 from ktrl.trainer.master_adamw import MasterAdamW
 from . import checkpoint_context
@@ -256,12 +256,21 @@ class Evidence(TrainerCallback):
                 control.should_training_stop = True
                 return control
             self.previous_round = self.out
-            next_round = self.out.parent.parent / f"round-{state.global_step + 1:02d}"
-            deadline = time.monotonic() + 7200
+            run_root = self.out.parent.parent
+            next_round = run_root / f"round-{state.global_step + 1:02d}"
+            deadline = time.monotonic() + 21600
             while not (next_round / "actor-ready.json").is_file():
+                stop = run_root / "actor-stop.json"
+                if stop.is_file():
+                    if json.loads(stop.read_text())["step"] != state.global_step:
+                        raise RuntimeError("Controller stop refers to a different Actor step")
+                    control.should_training_stop = True
+                    return control
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"No training batch released for {next_round}")
                 time.sleep(0.2)
+            if json.loads((next_round / "actor-ready.json").read_text())["step"] != state.global_step + 1:
+                raise RuntimeError(f"Controller released the wrong Actor step: {next_round}")
             dataset = FixedRows(next_round / "batch")
             validate_rows(dataset, self.plan)
             self.data.rows, self.data.valid_tokens = dataset.rows, dataset.valid_tokens
@@ -300,9 +309,14 @@ class Evidence(TrainerCallback):
                 old=torch.load(self.out/'old_logp'/f'{uid}.pt',weights_only=True)
                 delta=(new-old).double()
                 assert torch.isfinite(delta).all()
+                correction = self.trainer.rollout_correction
+                proxy_delta = delta
+                if correction["rollout_is"] == "token":
+                    sampling = torch.tensor(row["rollout_logprobs"], dtype=torch.float32)
+                    proxy_delta = delta * token_tis_weights(old, sampling, correction["rollout_is_threshold"])
                 records.append(dict(uid=uid,advantage=row['advantage'],tokens=n,
                     mean_delta=delta.mean().item(),mean_absolute_delta=delta.abs().mean().item(),
-                    weighted_delta_sum=(delta*row['advantage']).sum().item()))
+                    weighted_delta_sum=(proxy_delta*row['advantage']).sum().item()))
                 del logits,ids,new,old,delta
         gathered=[None]*dist.get_world_size()
         dist.all_gather_object(gathered,records)
@@ -336,8 +350,9 @@ class GRPOTrainer(Trainer):
                 cpu_parameters=getattr(self,'_kt_rank_local_optimizer_parameters',()),cpu_threads=48))
         return super().create_optimizer(model)
 
-    def __init__(self, dataset, evidence, **kwargs):
+    def __init__(self, dataset, evidence, *, rollout_correction, **kwargs):
         self.evidence, self.seen = evidence, []
+        self.rollout_correction = rollout_correction
         super().__init__(train_dataset=dataset, callbacks=[evidence], **kwargs)
         self.model_accepts_loss_kwargs = False
         self.grad_norm = None
@@ -368,6 +383,12 @@ class GRPOTrainer(Trainer):
         assert torch.isfinite(old).all()
         torch.save(old.cpu(), self.evidence.out / "old_logp" / (uid + ".pt"))
         sampling = inputs['rollout_logprobs']
+        weights = None
+        if self.rollout_correction["rollout_is"] == "token":
+            threshold = self.rollout_correction["rollout_is_threshold"]
+            weights = token_tis_weights(old, sampling, threshold)
+            self.evidence.event("rollout_token_tis", uid=uid, threshold=threshold,
+                                mean_weight=weights.mean().item(), max_weight=weights.max().item())
         if sampling.numel():
             assert sampling.shape == old.shape and torch.isfinite(sampling).all()
             delta=(old-sampling.to(old.device)).detach()
@@ -384,7 +405,8 @@ class GRPOTrainer(Trainer):
         current = token_logp()
         assert torch.isfinite(current).all()
         # Trainer divides by GAS; FSDP and KT divide by world size once.
-        numerator = policy_loss_sum(current, old, inputs["advantage"], torch.ones_like(targets,dtype=torch.bool))
+        numerator = policy_loss_sum(current, old, inputs["advantage"], torch.ones_like(targets,dtype=torch.bool),
+                                    rollout_is_weights=weights)
         loss = numerator * dist.get_world_size() * self.current_gradient_accumulation_steps / self.train_dataset.valid_tokens
         watch_loss_scale(loss,self.current_gradient_accumulation_steps,self.record_scale)
         self.seen.append(uid)
@@ -486,7 +508,8 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
     assert len(model._kt_wrappers)==40
     model.config.use_cache=False
     evidence.event("loaded",wrappers=len(model._kt_wrappers))
-    trainer = GRPOTrainer(dataset,evidence,model=model,args=args,data_collator=collate)
+    trainer = GRPOTrainer(dataset,evidence,model=model,args=args,data_collator=collate,
+                          rollout_correction=plan["rollout_correction"])
     from torch.distributed.fsdp import MixedPrecisionPolicy
     trainer.accelerator.state.fsdp_plugin.mixed_precision_policy=MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,reduce_dtype=torch.float32)
@@ -559,11 +582,13 @@ if __name__ == "__main__":
     parser.add_argument("--restore-from",type=Path)
     parser.add_argument("--resume-training",action='store_true')
     parser.add_argument("--save-model-only", action="store_true")
-    parser.add_argument("--resident-rounds", type=int, choices=(1, 2))
+    parser.add_argument("--resident-rounds", type=int)
     parser.add_argument('--validation-run',action='store_true',help='Only an isolated validation-fixed-* directory; never an online round')
     opts=parser.parse_args()
     if opts.resume_training and opts.restore_from is None:
         parser.error('--resume-training requires --restore-from')
+    if opts.resident_rounds is not None and opts.resident_rounds < 1:
+        parser.error("--resident-rounds must be positive")
     if opts.resident_rounds and opts.restore_from:
         parser.error("--resident-rounds requires a fresh online run")
     main(opts.config,opts.batch_dir,opts.out,opts.restore_from,opts.resume_training,

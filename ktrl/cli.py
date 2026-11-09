@@ -13,7 +13,7 @@ def main(argv=None):
     run = commands.add_parser("run", help="resolve a KTRL recipe")
     run.add_argument("--config", required=True, type=Path, help="KTRL YAML recipe")
     run.add_argument("--dry-run", action="store_true", help="print the resolved plan as JSON")
-    run.add_argument("--steps", type=int, help="override the planned update limit (1 or 2)")
+    run.add_argument("--steps", type=int, help="override trainer.steps with a positive update count")
     run.add_argument("--profiling", choices=("light", "full"), help="override the profiling preset")
     run.add_argument("--output-dir", type=Path, help="fresh directory in the guarded experiment root (KTRL_RUN_ROOT)")
     run.add_argument("--final-model-only", action="store_true",
@@ -35,11 +35,15 @@ def main(argv=None):
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
     if not args.dry_run:
-        if args.steps not in (1,2) or args.output_dir is None or args.profiling != 'light':
-            run.error("M4 execution requires --steps 1 or 2 --profiling light --output-dir <fresh directory>")
+        if args.output_dir is None or args.profiling != 'light':
+            run.error("Online execution requires --profiling light --output-dir <fresh directory>")
+        try:
+            steps = load_plan(args.config, steps=args.steps, profiling=args.profiling)["max_updates"]
+        except (ValueError, OSError) as error:
+            run.error(str(error))
         from .trainer.online import run as run_online
-        run_online(args.config, args.output_dir, steps=args.steps, final_model_only=args.final_model_only,
-                   resident_actor=args.resident_actor)
+        run_online(args.config, args.output_dir, steps=steps, final_model_only=args.final_model_only,
+                   resident_actor=args.resident_actor or steps > 2)
         return
     if args.final_model_only or args.resident_actor:
         run.error("Checkpoint and resident Actor options require execution")

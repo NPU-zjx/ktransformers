@@ -1,4 +1,4 @@
-"""Two online RL steps in an isolated, explicitly selected host process tree."""
+"""Run synchronous online RL in an isolated, explicitly selected host process tree."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, contextmanager
@@ -10,6 +10,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
 import threading
 import time
 import urllib.error
@@ -18,7 +19,9 @@ import uuid
 from ktrl.configs.recipe import REPO,load_plan,load_rollout_config
 from ktrl.workers.rollout.sglang.smoke import SGLangClient,validate_response
 from .online import save,phase,gpu_snapshot
-from ktrl.weights.identity import build_manifest
+from ktrl.weights.identity import build_manifest, sha256
+
+EXPORT_FREE_BYTES = 80 * 1024**3
 
 HOST=socket.gethostname().split('.')[0]
 ROOT=Path(os.environ.get('KTRL_RUN_ROOT',
@@ -278,7 +281,8 @@ def generate(client,folder,questions,inputs,policy):
         uid=f'm4-w{wave}-q{index:02d}'
         payload=dict(rid=uid,input_ids=questions[index]['prompt'],stream=False,return_logprob=True,
             sampling_params=dict(temperature=1.,top_p=1.,top_k=-1,max_new_tokens=inputs['max_response_tokens'],
-                sampling_seed=inputs['seed']+wave*1000+index,ignore_eos=False))
+                sampling_seed=inputs['seed']+questions[index]['dataset_row']*inputs['responses_per_prompt']+wave,
+                ignore_eos=False))
         with (folder/(uid+'-request.json')).open('x') as f:json.dump(payload,f)
         start=time.time_ns()
         result=client.call('/generate',payload,timeout=18000)
@@ -299,6 +303,41 @@ def generate(client,folder,questions,inputs,policy):
     return tokens
 
 
+def retire_model_export(root, checkpoint, step):
+    """Remove only manifest-listed weight shards from a superseded run export."""
+    expected = root / f"round-{step:02d}" / "actor" / "trainer" / f"checkpoint-{step}"
+    if checkpoint.resolve() != expected or not checkpoint.is_relative_to(root):
+        raise ValueError(f"Unexpected checkpoint path: {checkpoint}")
+    manifest = json.loads((checkpoint / "publication-manifest.json").read_text())
+    if manifest["version_id"] != step:
+        raise ValueError(f"Unexpected checkpoint version at {checkpoint}")
+    shards = [checkpoint / name for name in manifest["files"] if name.endswith(".safetensors")]
+    if not shards or any(p.resolve().parent != checkpoint or p.is_symlink() for p in shards):
+        raise ValueError(f"Unsafe publication shards at {checkpoint}")
+    for shard in shards:
+        shard.unlink()
+    save(checkpoint.parent.parent / "export-retired.json",
+         dict(step=step, manifest=str(checkpoint / "publication-manifest.json"),
+              removed_files=[shard.name for shard in shards]))
+
+
+def archive_rollout(current):
+    """Keep lossless raw rollout evidence in a bounded-size per-batch archive."""
+    rollout = current / "rollout"
+    archive = current / "rollout.tar.gz"
+    if rollout.resolve() != current.resolve() / "rollout" or rollout.is_symlink():
+        raise ValueError(f"Unexpected rollout path: {rollout}")
+    with tarfile.open(archive, "x:gz", compresslevel=1) as writer:
+        writer.add(rollout, arcname="rollout")
+    with tarfile.open(archive, "r:gz") as reader:
+        expected = {p.relative_to(current).as_posix(): p.stat().st_size for p in rollout.rglob("*") if p.is_file()}
+        actual = {item.name: item.size for item in reader if item.isfile()}
+        if actual != expected:
+            raise RuntimeError(f"Incomplete rollout archive: {archive}")
+    save(current / "rollout-archive.json", dict(file=archive.name, sha256=sha256(archive), files=len(expected)))
+    shutil.rmtree(rollout)
+
+
 def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
     import fcntl
     assert HOST in ('qjh000','qjh005'),'This entrypoint is restricted to authorized hosts'
@@ -310,7 +349,7 @@ def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
         if not validation or digest(validation['path']) != validation['sha256']:
             raise RuntimeError("Resident Actor requires verified native smoke evidence")
         proof = json.loads(Path(validation['path']).read_text())
-        if proof.get('resident_updates') != 2 or proof.get('source_sha256') != gate['source_sha256']:
+        if proof.get('resident_updates', 0) < min(steps, 3) or proof.get('source_sha256') != gate['source_sha256']:
             raise RuntimeError("Resident Actor smoke did not verify this source")
     assert out.parent==ROOT and out.name.startswith('rl-')
     with (ROOT/'.rl.lock').open('a') as lock:
@@ -319,26 +358,38 @@ def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
         out.mkdir()
         shutil.copyfile(config,out/'recipe.yaml')
         plan=load_plan(config,steps=steps,profiling='light')
+        assert plan['inputs']['prompts_per_step']==8 and plan['inputs']['responses_per_prompt']==4
         assert plan['inputs']['responses_per_update']==32 and plan['gradient_accumulation_steps']==4
         assert plan['inputs']['max_response_tokens']==8192 and plan['actor']['world_size']==8
+        if resident_actor and shutil.disk_usage(out).free < EXPORT_FREE_BYTES:
+            raise RuntimeError("Insufficient free space for the first model export")
         save(out/'resolved-plan.json',plan)
         status='failed';checkpoint=None
         try:
             with resources(out):
                 with phase(out,'prepare_prompts'):
+                    inputs = plan["inputs"]
+                    batch_size = inputs["prompts_per_step"]
                     run_worker(out,'prepare',['-m','ktrl.trainer.online_batch','prepare','--out',str(out),
                         '--model',plan['model']['path'],'--parquet',plan['inputs']['train_file'],
-                        '--reference',str(REPO/'profiling/data/jiaheng-prompts32.json')])
-                questions=json.loads((out/'prompts.json').read_text())
+                        '--prompt-count',str(steps*batch_size),'--seed',str(inputs['seed']),
+                        '--max-prompt-tokens',str(inputs['max_prompt_tokens'])])
+                prompt_schedule=json.loads((out/'prompts.json').read_text())
                 with service(config,out/'service',plan) as (client,pgid), ExitStack() as workers:
                     actor_proc = None
-                    control_probe(client,out/'service',questions[0]['prompt'],'v0',plan['inputs']['seed'])
-                    for step in range(1,steps+1):
+                    probe_prompt = prompt_schedule[0]["prompt"]
+                    control_probe(client,out/'service',probe_prompt,'v0',plan['inputs']['seed'])
+                    updates = 0
+                    for batch_index in range(steps):
+                        step = updates + 1
+                        questions = prompt_schedule[batch_index*batch_size:(batch_index+1)*batch_size]
                         current=out/f'round-{step:02d}';current.mkdir()
-                        shutil.copyfile(out/'prompts.json',current/'prompts.json')
+                        save(current/'prompts.json', questions)
                         shutil.copyfile(config,current/'recipe.yaml')
                         policy=f'v{step-1}'
                         save(current/'round.json',dict(**plan['inputs'],policy_version=policy,
+                            rollout_correction=plan["rollout_correction"],
+                            dataset_batch=batch_index+1, dataset_rows=[q["dataset_row"] for q in questions],
                             actor_resume_checkpoint=str(checkpoint) if checkpoint and not resident_actor else None,
                             resident_actor=resident_actor))
                         if checkpoint:
@@ -353,6 +404,16 @@ def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
                             checkpoint=str(checkpoint) if checkpoint else 'base'))
                         with phase(current,'reward_advantage'):
                             run_worker(current,'score',['-m','ktrl.trainer.online_batch','score','--out',str(current),'--model',plan['model']['path']])
+                        batch_audit = json.loads((current/'batch'/'batch-audit.json').read_text())
+                        if steps > 2:
+                            archive_rollout(current)
+                        if batch_audit["nonzero_advantage_responses"] == 0:
+                            save(current/'skipped.json', dict(reason="all GRPO advantages are zero", policy=policy))
+                            current.rename(out/f"skipped-batch-{batch_index+1:04d}")
+                            save(out/'data-cursor.json', dict(batches_consumed=batch_index+1, updates=updates))
+                            continue
+                        if resident_actor and shutil.disk_usage(out).free < EXPORT_FREE_BYTES:
+                            raise RuntimeError("Insufficient free space for the next model export")
                         with phase(current,'sleep_rollout'):
                             drain_rollout(client,current,'before-sleep')
                             save(current/'release.json',client.call('/release_memory_occupation',{},timeout=180))
@@ -384,15 +445,17 @@ def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
                         proof=json.loads((current/'actor/accepted.json').read_text())
                         assert proof['updates']==1 and proof['start_step']==step-1 and proof['end_step']==step
                         assert proof['checkpoint_kind']==('model_only' if model_only else 'full')
-                        if step==2:
+                        if step > 1:
                             for rank in range(8):
                                 resumed=json.loads((current/f'actor/resume-rank{rank}.json').read_text())
-                                assert resumed['restored_step']==1 and resumed['exact_parameter_and_moment_positions']>0
+                                assert resumed['restored_step']==resumed['scheduler_epoch']==step-1
+                                assert resumed['exact_parameter_and_moment_positions']>0
                                 if resident_actor:
-                                    previous=json.loads((out/f'round-01/actor/resident-rank{rank}.json').read_text())
+                                    previous=json.loads((out/f'round-{step-1:02d}/actor/resident-rank{rank}.json').read_text())
                                     latest=json.loads((current/f'actor/resident-rank{rank}.json').read_text())
                                     assert resumed['resident'] and resumed['pid']==previous['pid']==latest['pid']
                                     assert previous['optimizer_id']==latest['optimizer_id']
+                        previous_checkpoint = checkpoint
                         checkpoint=current/f'actor/trainer/checkpoint-{step}'
                         with phase(current,'publication_manifest'):
                             manifest_sha=build_manifest(checkpoint)
@@ -411,7 +474,7 @@ def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
                                 for layer in range(40):
                                     verified=json.loads((out/f'service/cpu-verified-v{step}-layer{layer}.json').read_text())
                                     assert verified['packed_native_forward_relative_l2']<=.06
-                                control_probe(client,out/'service',questions[0]['prompt'],f'v{step}',plan['inputs']['seed'])
+                                control_probe(client,out/'service',probe_prompt,f'v{step}',plan['inputs']['seed'])
                                 import torch
                                 previous=torch.load(out/f'service/v{step-1}-control-logits.pt',weights_only=True)
                                 latest=torch.load(out/f'service/v{step}-control-logits.pt',weights_only=True)
@@ -426,12 +489,23 @@ def run(config,out,*,steps=2,final_model_only=False,resident_actor=False):
                                 rank_failures=[json.loads(p.read_text()) for p in (out/'service').glob('publication-failed-rank*.json')]))
                             raise
                         save(current/'accepted.json',dict(updates=1,output_tokens=tokens,generated_policy=policy,published_policy=f'v{step}'))
-                    probe=dict(input_ids=questions[0]['prompt'],sampling_params=dict(temperature=0,max_new_tokens=32,sampling_seed=plan['inputs']['seed']))
-                    save(out/f'final-v{steps}-generation.json',client.generate(probe))
-                    assert all(json.loads((out/f'service/replays-rank{r}.json').read_text()).get(f'v{steps}',0)>0 for r in range(8))
+                        updates = step
+                        save(out/'data-cursor.json', dict(batches_consumed=batch_index+1, updates=updates))
+                        if resident_actor and steps > 2 and previous_checkpoint is not None:
+                            retire_model_export(out, previous_checkpoint, step-1)
+                    if not updates:
+                        raise RuntimeError("No batch had nonzero GRPO advantages")
+                    if actor_proc is not None and updates < steps:
+                        save(out/'actor-stop.json', dict(step=updates))
+                        if actor_proc.wait(timeout=120) != 0:
+                            raise RuntimeError(f"Resident Actor exited {actor_proc.returncode}")
+                    probe=dict(input_ids=probe_prompt,sampling_params=dict(temperature=0,max_new_tokens=32,sampling_seed=plan['inputs']['seed']))
+                    save(out/f'final-v{updates}-generation.json',client.generate(probe))
+                    assert all(json.loads((out/f'service/replays-rank{r}.json').read_text()).get(f'v{updates}',0)>0 for r in range(8))
                 guard_gpu()
-                save(out/'accepted.json',dict(real_online_updates=steps,second_rollout_policy='v1' if steps==2 else None,
-                    optimizer_steps=list(range(1,steps+1)),optimizer_state_verified_before_second_backward=steps==2,final_generation_policy=f'v{steps}',
+                save(out/'accepted.json',dict(real_online_updates=updates, dataset_batches=steps, skipped_batches=steps-updates,
+                    optimizer_steps=list(range(1,updates+1)), optimizer_state_verified_before_updates=list(range(2,updates+1)),
+                    final_generation_policy=f'v{updates}',
                     final_checkpoint_kind='model_only' if final_model_only or resident_actor else 'full',
                     resident_actor=resident_actor,
                     numerical_parity='deferred; no claim of actor-rollout numerical agreement'))

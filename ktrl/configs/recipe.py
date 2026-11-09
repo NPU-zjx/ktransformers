@@ -119,8 +119,14 @@ def load_plan(config_path, *, steps=None, profiling=None):
     from ktrl.workers.engine.fsdp.config import plan_actor
 
     path, cfg, group = _read_recipe(config_path)
-    algorithm = fields(cfg.get("algorithm", {}), "algorithm", ("adv_estimator",))
+    algorithm = fields(cfg.get("algorithm", {}), "algorithm", ("adv_estimator", "rollout_correction"))
     estimator = require(algorithm.get("adv_estimator", "grpo"), "algorithm.adv_estimator", ("grpo",))
+    correction = fields(algorithm.get("rollout_correction", {}), "algorithm.rollout_correction",
+                        ("rollout_is", "rollout_is_threshold"))
+    rollout_is = require(correction.get("rollout_is"), "algorithm.rollout_correction.rollout_is", (None, "token"))
+    threshold = correction.get("rollout_is_threshold", 2.0)
+    if type(threshold) not in (int, float) or not 0 < threshold < float("inf"):
+        raise ValueError("rollout_is_threshold must be finite and positive")
     model = read_model(group.get("model"), path.parent)
     placement = shared_placement(cfg, group, model)
     rollout = plan_rollout(group.get("rollout", {}), model, path.parent, placement)
@@ -131,7 +137,7 @@ def load_plan(config_path, *, steps=None, profiling=None):
     ref = optional_role(group.get("ref", {}), "actor_rollout_ref.ref")
     critic = optional_role(cfg.get("critic", {}), "critic")
     trainer = fields(cfg.get("trainer", {}), "trainer", ("steps", "gradient_accumulation_steps", "optimizer_schedule_steps"))
-    num_steps = integer(trainer.get("steps", 1) if steps is None else steps, "trainer.steps", 1, 2)
+    num_steps = integer(trainer.get("steps", 1) if steps is None else steps, "trainer.steps")
     inputs = plan_inputs(cfg.get('data', {}),path.parent)
     gas = integer(trainer.get('gradient_accumulation_steps',4),'trainer.gradient_accumulation_steps')
     if inputs['responses_per_update'] != actor['world_size']*gas:
@@ -144,6 +150,7 @@ def load_plan(config_path, *, steps=None, profiling=None):
         "orchestrator": "KTRL",
         "recipe": str(path),
         "algorithm": estimator,
+        "rollout_correction": {"rollout_is": rollout_is, "rollout_is_threshold": threshold},
         "model": model,
         "expert_placement": placement,
         "active_roles": ["rollout", "actor"] + (["ref"] if ref["enabled"] else []),
@@ -153,7 +160,8 @@ def load_plan(config_path, *, steps=None, profiling=None):
         "critic": critic,
         "inputs": inputs,
         "gradient_accumulation_steps": gas,
-        "optimizer_schedule_steps": integer(trainer.get('optimizer_schedule_steps',418),'trainer.optimizer_schedule_steps',num_steps),
+        "optimizer_schedule_steps": integer(trainer.get('optimizer_schedule_steps',max(418, num_steps)),
+                                            'trainer.optimizer_schedule_steps',num_steps),
         "max_updates": num_steps,
         "profiling": profile_windows(preset),
         "resources": {

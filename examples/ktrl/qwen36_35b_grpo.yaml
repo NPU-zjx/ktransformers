@@ -37,7 +37,7 @@ data:
   seed: 42
   overlong_buffer_tokens: 256  # Frozen original GPU RL recipe; maximum is 8192.
 trainer:
-  steps: 2
+  steps: 32
   gradient_accumulation_steps: 4
   optimizer_schedule_steps: 418
 profiling:

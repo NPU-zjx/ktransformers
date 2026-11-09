@@ -53,6 +53,20 @@ class DryRunTest(unittest.TestCase):
             cwd=ROOT, capture_output=True, text=True, check=False,
         )
 
+    def test_optional_rollout_correction(self):
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(json.loads(result.stdout)["rollout_correction"]["rollout_is"])
+        self.config["algorithm"]["rollout_correction"] = {"rollout_is": "token", "rollout_is_threshold": 1.5}
+        result = self.invoke("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["rollout_correction"],
+                         {"rollout_is": "token", "rollout_is_threshold": 1.5})
+        self.config["algorithm"]["rollout_correction"]["rollout_is_threshold"] = -1
+        result = self.invoke("--dry-run")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("finite and positive", result.stderr)
+
     def test_shared_placement_and_cli_overrides(self):
         result = self.invoke("--dry-run", "--steps", "2", "--profiling", "light")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -126,8 +140,17 @@ class DryRunTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("config.json", result.stderr)
 
-    def test_execution_requires_explicit_single_step_and_output(self):
+    def test_execution_requires_profiling_and_output(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 2)
-        self.assertIn("M4 execution requires --steps 1 or 2 --profiling light --output-dir", result.stderr)
+        self.assertIn("Online execution requires --profiling light --output-dir", result.stderr)
         self.assertEqual(result.stdout, "")
+
+    def test_full_dataset_update_count(self):
+        del self.config["trainer"]["optimizer_schedule_steps"]
+        result = self.invoke("--dry-run", "--steps", "1672")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(result.stdout)
+        self.assertEqual(plan["max_updates"], 1672)
+        self.assertEqual(plan["optimizer_schedule_steps"], 1672)
+        self.assertEqual(plan["inputs"]["responses_per_update"], 32)
