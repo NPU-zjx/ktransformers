@@ -1,12 +1,12 @@
 # KTRL 配方
 
-[qwen36_35b_grpo.yaml](qwen36_35b_grpo.yaml) 是 qjh005 的离线预览配方。在 KT 仓库根目录执行：
+[qwen36_35b_grpo.yaml](qwen36_35b_grpo.yaml) 对应 qjh005 常驻 Actor 两轮验收的配方。在 KT 仓库根目录预览：
 
 ```bash
 ./bin/ktrl run --config examples/ktrl/qwen36_35b_grpo.yaml --dry-run
 ```
 
-该配方选择 KT-SGLang TP8、HF/FSDP2 + KT Full BF16 Actor、8 个训练 rank 和 1 次计划更新。全局字段 `expert_placement.gpu_experts_per_layer` 同时决定训练和推理的专家归属。当前 Full Actor 取 0，即每个 MoE 层的全部路由专家在 CPU。兼容读取旧版每角色字段，冲突值在 dry-run 和 rollout 入口均报错。
+该配方选择 KT-SGLang TP8、HF/FSDP2 + KT Full Actor、8 个训练 rank 和 2 次计划更新。每步 8 题 × 4 答、回答上限 8192 token、GAS4。CPU 专家使用 BF16 计算，非专家参数分片为 FP32。`expert_placement.gpu_experts_per_layer: 0` 使两端的路由专家全部在 CPU。在线执行与验收门槛见 [KTRL README](../../ktrl/README.md)。以下 M2、M3 命令是独立组件验证入口。
 
 ## M2 固定批次 Actor 验证
 

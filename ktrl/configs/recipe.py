@@ -67,16 +67,22 @@ def optional_role(config, label):
 
 
 def plan_inputs(config, recipe_dir):
-    fields(config, "data", ("train_file", "prompts_per_step", "responses_per_prompt"))
+    fields(config, "data", ("train_file", "prompts_per_step", "responses_per_prompt", "max_response_tokens", "max_prompt_tokens", "context_length", "seed", "overlong_buffer_tokens"))
     train_file = config.get("train_file")
     if train_file is not None:
         train_file = path_from(train_file, "data.train_file", recipe_dir)
         if not train_file.is_file():
             raise ValueError(f"data.train_file: missing file {train_file}")
-    prompts = integer(config.get("prompts_per_step", 32), "data.prompts_per_step")
+    prompts = integer(config.get("prompts_per_step", 8), "data.prompts_per_step")
     answers = integer(config.get("responses_per_prompt", 4), "data.responses_per_prompt", 2)
+    response = integer(config.get('max_response_tokens',8192),'data.max_response_tokens')
+    prompt = integer(config.get('max_prompt_tokens',1024),'data.max_prompt_tokens')
+    context = integer(config.get('context_length',9216),'data.context_length',prompt+response)
     return {"train_file": str(train_file) if train_file else None, "prompts_per_step": prompts,
-            "responses_per_prompt": answers, "responses_per_update": prompts * answers}
+            "responses_per_prompt": answers, "responses_per_update": prompts * answers,
+            'max_response_tokens':response,'max_prompt_tokens':prompt,'context_length':context,
+            'seed':integer(config.get('seed',42),'data.seed',0),
+            'overlong_buffer_tokens':integer(config.get('overlong_buffer_tokens',0),'data.overlong_buffer_tokens',0,response)}
 
 
 def profile_windows(preset):
@@ -124,8 +130,12 @@ def load_plan(config_path, *, steps=None, profiling=None):
             raise ValueError(f"missing KT backend source: {REPO / backend['native_source']}")
     ref = optional_role(group.get("ref", {}), "actor_rollout_ref.ref")
     critic = optional_role(cfg.get("critic", {}), "critic")
-    trainer = fields(cfg.get("trainer", {}), "trainer", ("steps",))
+    trainer = fields(cfg.get("trainer", {}), "trainer", ("steps", "gradient_accumulation_steps", "optimizer_schedule_steps"))
     num_steps = integer(trainer.get("steps", 1) if steps is None else steps, "trainer.steps", 1, 2)
+    inputs = plan_inputs(cfg.get('data', {}),path.parent)
+    gas = integer(trainer.get('gradient_accumulation_steps',4),'trainer.gradient_accumulation_steps')
+    if inputs['responses_per_update'] != actor['world_size']*gas:
+        raise ValueError('responses_per_update must equal actor world_size * GAS (microbatch=1)')
     profile = fields(cfg.get("profiling", {}), "profiling", ("preset",))
     preset = require(profile.get("preset", "full") if profiling is None else profiling,
                      "profiling.preset", ("light", "full"))
@@ -141,7 +151,9 @@ def load_plan(config_path, *, steps=None, profiling=None):
         "actor": actor,
         "ref": ref,
         "critic": critic,
-        "inputs": plan_inputs(cfg.get("data", {}), path.parent),
+        "inputs": inputs,
+        "gradient_accumulation_steps": gas,
+        "optimizer_schedule_steps": integer(trainer.get('optimizer_schedule_steps',418),'trainer.optimizer_schedule_steps',num_steps),
         "max_updates": num_steps,
         "profiling": profile_windows(preset),
         "resources": {
