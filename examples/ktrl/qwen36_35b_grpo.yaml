@@ -1,0 +1,36 @@
+# KTRL Phase 1. Both roles use the same expert IDs on each device type.
+algorithm:
+  adv_estimator: grpo
+expert_placement:
+  strategy: uniform
+  gpu_experts_per_layer: 0
+actor_rollout_ref:
+  model:
+    path: /mnt/qjh007/models/Qwen3.6-35B-A3B
+    dtype: bfloat16
+  rollout:
+    name: sglang
+    tp_size: 8
+    kt_method: BF16
+    kt_cpuinfer: 32
+    kt_threadpool_count: 2
+  actor:
+    strategy: fsdp2
+    world_size: 8
+    training_scope: full
+    kt_num_threads: 48
+    kt_threadpool_count: 1
+  ref:
+    enabled: false
+    strategy: fsdp2
+critic:
+  enabled: false
+  strategy: fsdp2
+data:
+  train_file: /raid/data/zjx/gpu-baseline/data/full20k-20261025/train-13376.parquet
+  prompts_per_step: 32
+  responses_per_prompt: 4
+trainer:
+  steps: 1
+profiling:
+  preset: full
