@@ -11,6 +11,10 @@
   <strong><a href="#-概览">🎯 概览</a> | <a href="#-推理---kt-kernel-高性能推理">🚀 推理</a> | <a href="#-sft---llama-factory-微调">🎓 SFT</a> | <a href="#-引用">🔥 引用</a> </strong>
 </div>
 
+## KTRL：多轮在线 RL 已跑通
+
+本 fork 的 [KTRL](./ktrl/README.md) 自动串联 KT-SGLang 现场生成、奖励和 GRPO 优势、常驻 FSDP2 Actor 更新及权重发布。35B 正式运行截至北京时间 2026-11-10 15:30 已完成 19 个有更新的 RL 轮次、38 次优化器更新，并已从完整 checkpoint 恢复续跑。全量训练仍在进行，训推数值一致性和长期学习效果待验收。[运行证据快照](./ktrl/docs/multi-round-status.md)。
+
 ## 🎯 概览
 
 KTransformers 是一个专注于通过 CPU-GPU 异构计算实现大语言模型高效推理和微调的研究项目。目前两个面向用户的能力都来自 kt-kernel 源码目录：[推理](./kt-kernel/README.md) 和 [SFT](./doc/en/SFT/KTransformers-Fine-Tuning_Quick-Start.md)。

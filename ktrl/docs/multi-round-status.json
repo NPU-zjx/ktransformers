@@ -1,0 +1,192 @@
+{
+  "captured_at": "2026-11-10T15:35:20+08:00",
+  "run_directory": "/raid/data/zjx/kt-baseline/results/ktrl-formal-local-20261110-resume20-a01",
+  "files": {
+    "data-cursor.json": {
+      "sha256": "9900636e295d4e01363e7d273f6cc20d3869cad57ed222b1f8a878eb887ccede",
+      "content": {
+        "batches_consumed": 21,
+        "updates": 19,
+        "optimizer_steps": 38
+      }
+    },
+    "source.json": {
+      "sha256": "9a9102a88f10d35b679f82757c8edea84f2226f9b2bdda4d3f0b73d168805d26",
+      "content": {
+        "repo": "/raid/data/zjx/kt-baseline/ktransformers",
+        "source_sha256": "6ba76b5299bad4fa23a7187f416fbb851c810a58f3d7cf472bca6debc49fd57f",
+        "head": "5a275ecb9a1a4b080077156cbab97ae38236b1ec",
+        "dirty": true
+      }
+    },
+    "resumed.json": {
+      "sha256": "4641e6a23c72397b15c9e41cc1cf78d4c228d6d827c122e15de2cf9b9dcf7b5e",
+      "content": {
+        "contract": {
+          "model": {
+            "path": "/mnt/qjh007/models/Qwen3.6-35B-A3B",
+            "metadata": "/mnt/qjh007/models/Qwen3.6-35B-A3B/config.json",
+            "architecture": "Qwen3_5MoeForConditionalGeneration",
+            "dtype": "bfloat16",
+            "text_layers": 40,
+            "routed_experts_per_moe_layer": 256,
+            "experts_per_token": 8
+          },
+          "expert_placement": {
+            "policy": "uniform",
+            "routed_experts_per_moe_layer": 256,
+            "gpu": {
+              "count": 0,
+              "ids_inclusive": null
+            },
+            "cpu": {
+              "count": 256,
+              "ids_inclusive": [
+                0,
+                255
+              ]
+            }
+          },
+          "actor": {
+            "ppo_mini_batch_size": 8,
+            "ppo_epochs": 2,
+            "shuffle": false,
+            "data_loader_seed": 42,
+            "backend": "HF/FSDP2 + KT SFT",
+            "strategy": "fsdp2",
+            "world_size": 8,
+            "training_scope": "full",
+            "learning_rate": 1e-06,
+            "nonexpert_parameter_dtype": "float32",
+            "mixed_precision_policy": {
+              "param_dtype": "bfloat16",
+              "reduce_dtype": "float32"
+            },
+            "cpu_expert_optimizer": {
+              "name": "KTRL MasterAdamW",
+              "master_dtype": "float32",
+              "moment_dtype": "float32",
+              "compute_copy_dtype": "bfloat16",
+              "gradient_buffer_dtype": "bfloat16",
+              "device": "cpu"
+            },
+            "fsdp_api": "torch.distributed.fsdp.fully_shard",
+            "kt_loader": "kt_kernel.sft.wrapper.load_kt_model",
+            "native_source": "kt-kernel/python/sft/wrapper.py",
+            "kt_config": {
+              "kt_backend": "AMXBF16",
+              "kt_expert_weight_format": "bf16",
+              "kt_train_mode": "full",
+              "kt_num_gpu_experts": 0,
+              "kt_num_threads": 48,
+              "kt_threadpool_count": 1,
+              "kt_tp_enabled": false
+            },
+            "expert_placement": {
+              "policy": "uniform",
+              "routed_experts_per_moe_layer": 256,
+              "gpu": {
+                "count": 0,
+                "ids_inclusive": null
+              },
+              "cpu": {
+                "count": 256,
+                "ids_inclusive": [
+                  0,
+                  255
+                ]
+              }
+            },
+            "ownership_target": {
+              "cpu": "KT routed expert weights, gradients and optimizer state on the rank-0 owner",
+              "gpu": "FSDP2-managed non-expert parameters including attention, router and shared path"
+            },
+            "minibatch_responses": 32,
+            "minibatches_per_epoch": 1,
+            "optimizer_steps_per_rollout": 2
+          },
+          "inputs": {
+            "train_file": "/raid/data/zjx/gpu-baseline/data/full20k-20261025/train-13376.parquet",
+            "prompts_per_step": 8,
+            "responses_per_prompt": 4,
+            "responses_per_update": 32,
+            "max_response_tokens": 8192,
+            "max_prompt_tokens": 1024,
+            "context_length": 9216,
+            "seed": 42,
+            "overlong_buffer_tokens": 256
+          },
+          "rollout_correction": {
+            "bypass_mode": false,
+            "rollout_is": null,
+            "rollout_is_threshold": 2.0
+          },
+          "gradient_accumulation_steps": 4,
+          "optimizer_schedule_steps": 3344
+        },
+        "completed_rounds": 10,
+        "optimizer_steps": 20,
+        "batches_consumed": 10,
+        "source_run": "/raid/data/zjx/kt-baseline/results/ktrl-formal-local-20261109-a01"
+      }
+    },
+    "round-18/accepted.json": {
+      "sha256": "b1d9ff2718fa4a976f9dbbbfa50aafa93b8a1c3ec317c24bb17f4a5585077b41",
+      "content": {
+        "updates": 2,
+        "output_tokens": 213059,
+        "generated_policy": "v34",
+        "published_policy": "v36"
+      }
+    },
+    "round-19/accepted.json": {
+      "sha256": "efac4043859cd4346df43ba321c939edf18451f4a6622069399cda262aa136d3",
+      "content": {
+        "updates": 2,
+        "output_tokens": 194887,
+        "generated_policy": "v36",
+        "published_policy": "v38"
+      }
+    },
+    "round-20/round.json": {
+      "sha256": "f85db809350730b338d76702b37ccecac066ad6109e1f7951d37f4bf9608a6fe",
+      "content": {
+        "train_file": "/raid/data/zjx/gpu-baseline/data/full20k-20261025/train-13376.parquet",
+        "prompts_per_step": 8,
+        "responses_per_prompt": 4,
+        "responses_per_update": 32,
+        "max_response_tokens": 8192,
+        "max_prompt_tokens": 1024,
+        "context_length": 9216,
+        "seed": 42,
+        "overlong_buffer_tokens": 256,
+        "policy_version": "v38",
+        "rollout_correction": {
+          "bypass_mode": false,
+          "rollout_is": null,
+          "rollout_is_threshold": 2.0
+        },
+        "dataset_batch": 22,
+        "dataset_rows": [
+          5303,
+          5548,
+          9126,
+          2488,
+          1844,
+          11571,
+          756,
+          12772
+        ],
+        "actor_resume_checkpoint": null,
+        "resident_actor": true
+      }
+    },
+    "round-20/current-phase.json": {
+      "sha256": "df71b7204bb77ef4c3c7367daddae19633b2daab16d108485fb16bdd95eba360",
+      "content": {
+        "phase": "live_rollout_v38",
+        "start_unix_ns": 1794295759742412195
+      }
+    }
+  }
+}

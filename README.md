@@ -11,6 +11,10 @@
   <strong><a href="#-overview">🎯 Overview</a> | <a href="#-inference---high-performance-kt-kernel-serving">🚀 Inference</a> | <a href="#-sft---fine-tuning-with-llama-factory">🎓 SFT</a> | <a href="#-citation">🔥 Citation</a> | <a href="https://github.com/kvcache-ai/ktransformers/issues/1921">🚀 Roadmap(2026Q2)</a>  </strong>
 </div>
 
+## KTRL: multi-round online RL
+
+This fork includes [KTRL](./ktrl/README.md), which automatically connects KT-SGLang rollout, rewards and GRPO advantages, resident FSDP2 Actor updates, and policy publication. Multi-round execution and full-checkpoint resume have been exercised on a 35B model: 19 updated RL rounds and 38 optimizer steps as of November 10, 2026, 15:30 Asia/Shanghai. The full dataset run is ongoing; numerical parity and long-term learning quality remain under evaluation. [Evidence snapshot](./ktrl/docs/multi-round-status.md).
+
 ## 🎯 Overview
 
 KTransformers is a research project focused on efficient inference and fine-tuning of large language models through CPU-GPU heterogeneous computing. The project now exposes two user-facing capabilities from the kt-kernel source tree: [Inference](./kt-kernel/README.md) and [SFT](./doc/en/SFT/KTransformers-Fine-Tuning_Cookbook.md).
