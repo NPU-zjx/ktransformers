@@ -1,5 +1,7 @@
 # KTRL 配方
 
+KTRL 已实测跑通多轮在线 RL，没有两轮上限。当前正式验收进度和恢复证据见[运行快照](../../ktrl/docs/multi-round-status.md)；历史两轮测试不代表当前功能限制。
+
 [qwen36_35b_grpo.yaml](qwen36_35b_grpo.yaml) 配置 Qwen3.6-35B-A3B、KT-SGLang TP8、HF/FSDP2 Actor 八 rank、每批 8 题 × 4 答、GAS4 和 8192 回答 token 上限。Actor 和 rollout 的路由专家均在 CPU。
 
 在仓库根目录预览配方。将模型和数据路径设为实际环境的路径。

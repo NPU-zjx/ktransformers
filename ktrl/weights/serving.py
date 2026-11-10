@@ -3,6 +3,8 @@
 import json
 import os
 import hashlib
+import time
+from datetime import timedelta
 from pathlib import Path
 
 
@@ -111,7 +113,15 @@ def install():
 
     LogitsProcessor.forward = logits
 
+    publication_group = None
+    publication_timeout = timedelta(minutes=15)
+
     def update(self, model_path, load_format, weight_name_filter=None, recapture_cuda_graph=False):
+        nonlocal publication_group
+        if publication_group is None:
+            # Rank 0 loads and verifies CPU experts while its peers wait. A
+            # GPU barrier would start the NCCL watchdog during that CPU work.
+            publication_group = dist.new_group(backend="gloo", timeout=publication_timeout)
         flush_replay_counts()
         path = Path(model_path)
         error=None
@@ -120,7 +130,7 @@ def install():
         except Exception as exc:
             error=str(exc)
         errors=[None]*dist.get_world_size()
-        dist.all_gather_object(errors,error)
+        dist.all_gather_object(errors, error, group=publication_group)
         if any(errors):return False,f'Publication preflight failed: {errors}'
         label = f'v{step}'
         if step < 1:
@@ -188,13 +198,17 @@ def install():
                         expected_router=source.get_tensor(keys[0]).reshape(-1)[router_sample].to(router.dtype).item()
             assert expected_router is not None
             assert router_value == expected_router
+            expert_load_start = time.monotonic()
             for module, method in methods:
                 method.process_weights_after_loading(module)
+            expert_load_seconds = time.monotonic() - expert_load_start
             parameter_hashes(self.model, f'published-v{step}')
-            dist.barrier()
+            dist.monitored_barrier(group=publication_group, timeout=publication_timeout)
+            graph_start = time.monotonic()
             self.init_device_graphs()
             torch.cuda.synchronize()
-            dist.barrier()
+            graph_capture_seconds = time.monotonic() - graph_start
+            dist.monitored_barrier(group=publication_group, timeout=publication_timeout)
             rank = dist.get_rank()
             proof = {
                 "rank": rank, "version": str(path), "cpu_expert_layers": len(methods) if rank == 0 else 0,
@@ -202,6 +216,9 @@ def install():
                 "router_value": router_value, "checkpoint_router_value": expected_router,
                 "expert_gpu_staging_bytes": 0, "nonexpert_tensors": loaded,
                 "graph_recaptured": True, "policy_version":label, "actor_step":step,
+                "publication_rendezvous_backend": "gloo",
+                "expert_load_seconds": expert_load_seconds,
+                "graph_capture_seconds": graph_capture_seconds,
                 "manifest_sha256":manifest_sha}
             for filename in (f'published-rank{rank}.json',f'published-{label}-rank{rank}.json'):
                 (root/filename).write_text(json.dumps(proof))
