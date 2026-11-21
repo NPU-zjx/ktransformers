@@ -12,11 +12,12 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import Dataset, SequentialSampler
 from ktrl.trainer.ppo_schedule import schedule
-from transformers import AutoModelForImageTextToText, Trainer, TrainerCallback, TrainingArguments
+import transformers
+from transformers import Trainer, TrainerCallback, TrainingArguments
 from kt_kernel.sft import get_kt_named_trainable_params, get_kt_rank_local_parameter_names
 from kt_kernel.sft.profiler import collect_kt_sft_profile
 
-from ktrl.configs.recipe import load_plan
+from ktrl.configs.recipe import architecture_spec, load_plan
 from ktrl.trainer.grpo import policy_loss_sum, select_old_logp, token_tis_weights
 from ktrl.trainer.gradient_audit import watch_loss_scale, gradient_snapshot, verify_clip
 from ktrl.trainer.master_adamw import MasterAdamW
@@ -180,7 +181,8 @@ class Evidence(TrainerCallback):
         shards = [(n, p) for n, p in model.named_parameters() if hasattr(p, "to_local")]
         assert all(p.dtype==torch.float32 for _,p in shards if p.requires_grad)
         policy=trainer.accelerator.state.fsdp_plugin.mixed_precision_policy
-        assert policy.param_dtype==torch.bfloat16 and policy.reduce_dtype==torch.float32
+        expected_reduce = getattr(torch, self.plan['actor']['mixed_precision_policy']['reduce_dtype'])
+        assert policy.param_dtype==torch.bfloat16 and policy.reduce_dtype==expected_reduce
         assert shards
         placeholders = list(get_kt_rank_local_parameter_names(model))
         params = dict(model.named_parameters())
@@ -588,10 +590,12 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
         bf16=True,seed=plan['inputs']['seed'],ignore_data_skip=True,gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant":False,"context_fn":checkpoint_context},
         fsdp="full_shard auto_wrap",fsdp_config={"version":2,"cpu_ram_efficient_loading":True,
-           "reshard_after_forward":True,"transformer_layer_cls_to_wrap":["Qwen3_5MoeDecoderLayer","Qwen3_5MoeVisionBlock"]},
+           "reshard_after_forward":True,"transformer_layer_cls_to_wrap":architecture_spec(plan["model"]["architecture"])["wrap_classes"]},
         kt_config=kt)
     master_dtype = getattr(torch,plan['actor']['nonexpert_parameter_dtype'])
-    model = AutoModelForImageTextToText.from_pretrained(str(restore_from or plan["model"]["path"]),
+    arch_spec = architecture_spec(plan['model']['architecture'])
+    auto_model_cls = getattr(transformers, arch_spec['auto_model_cls'])
+    model = auto_model_cls.from_pretrained(str(restore_from or plan["model"]["path"]),
                 dtype=master_dtype if restore_from else torch.bfloat16,
                 device_map={"":f"cuda:{rank}"},attn_implementation="sdpa",local_files_only=True)
     # LlamaFactory full tuning upcasts registered trainable parameters; native KT
@@ -607,8 +611,9 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
     trainer = GRPOTrainer(dataset,evidence,model=model,args=args,data_collator=collate,
                           rollout_correction=plan["rollout_correction"])
     from torch.distributed.fsdp import MixedPrecisionPolicy
+    reduce_dtype = getattr(torch, plan['actor']['mixed_precision_policy']['reduce_dtype'])
     trainer.accelerator.state.fsdp_plugin.mixed_precision_policy=MixedPrecisionPolicy(
-        param_dtype=torch.bfloat16,reduce_dtype=torch.float32)
+        param_dtype=torch.bfloat16,reduce_dtype=reduce_dtype)
     evidence.trainer=trainer
     trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     # Trainer initializes the FSDP plugin in sharded mode and rejects model-only

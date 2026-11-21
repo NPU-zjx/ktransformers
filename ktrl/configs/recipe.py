@@ -30,6 +30,35 @@ class RecipeLoader(yaml.SafeLoader):
         return super().construct_mapping(node, deep=deep)
 
 
+
+ARCHITECTURE_SPECS = {
+    "Qwen3_5MoeForConditionalGeneration": {
+        "auto_model_cls": "AutoModelForImageTextToText",
+        "wrap_classes": ["Qwen3_5MoeDecoderLayer", "Qwen3_5MoeVisionBlock"],
+        "expert_module_names": ("Qwen3_5MoeExperts",),
+        "needs_vlm_conv3d_patch": True,
+    },
+    "Qwen3MoeForCausalLM": {
+        "auto_model_cls": "AutoModelForCausalLM",
+        "wrap_classes": ["Qwen3MoeDecoderLayer"],
+        "expert_module_names": ("Qwen3MoeExperts",),
+        "needs_vlm_conv3d_patch": False,
+    },
+}
+
+
+def architecture_spec(architecture: str) -> dict:
+    if architecture not in ARCHITECTURE_SPECS:
+        raise ValueError(f"Unsupported KTRL architecture: {architecture!r}")
+    spec = ARCHITECTURE_SPECS[architecture]
+    return {
+        "auto_model_cls": spec["auto_model_cls"],
+        "wrap_classes": list(spec["wrap_classes"]),
+        "expert_module_names": tuple(spec["expert_module_names"]),
+        "needs_vlm_conv3d_patch": spec["needs_vlm_conv3d_patch"],
+    }
+
+
 def read_model(config, recipe_dir):
     label = "actor_rollout_ref.model"
     fields(config, label, ("path", "dtype"))

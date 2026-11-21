@@ -1,5 +1,5 @@
 # KTRL FifthTask Phase 2/3 frozen recipe for Qwen3-30B-A3B + HotpotQA (distractor) on 8x RTX 4090.
-# Note: Precision (BF16 grad accum / FP32 master policy) and Actor offload remain Phase 3 decisions.
+# Phase 3 Scheme B precision: CPU FP32 master + FP32 Adam moments retained; GPU FP32 shards + BF16 reduce_dtype; Actor offload pending Phase 3 VRAM measurement.
 algorithm:
   adv_estimator: grpo
   rollout_correction:
@@ -23,7 +23,8 @@ actor_rollout_ref:
     strategy: fsdp2
     world_size: 8
     training_scope: full
-    nonexpert_parameter_dtype: float32  # Current parser baseline; Phase 3 precision policy pending user decision.
+    nonexpert_parameter_dtype: float32  # GPU FSDP2 FP32 shard high-precision update base.
+    reduce_dtype: bfloat16              # Scheme B: BF16 FSDP2 gradient reduction.
     learning_rate: 1.0e-6
     ppo_mini_batch_size: 4
     ppo_epochs: 1

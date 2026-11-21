@@ -7,10 +7,11 @@ from pathlib import Path
 import re
 import torch
 import torch.distributed as dist
-from transformers import AutoModelForImageTextToText,Trainer,TrainerCallback,TrainingArguments
+import transformers
+from transformers import Trainer,TrainerCallback,TrainingArguments
 from torch.distributed.fsdp import MixedPrecisionPolicy
 from kt_kernel.sft import get_kt_named_trainable_params
-from ktrl.configs.recipe import load_plan
+from ktrl.configs.recipe import architecture_spec, load_plan
 from ktrl.trainer.grpo import policy_loss_sum
 from .actor_update import TokenLogProbs
 from . import checkpoint_context
@@ -73,11 +74,13 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
         bf16=True,report_to='none',save_strategy='no',remove_unused_columns=False,dataloader_pin_memory=False,
         gradient_checkpointing=not no_checkpoint,gradient_checkpointing_kwargs=dict(use_reentrant=False,**({'context_fn':checkpoint_context} if backend=='kt' else {})),
         fsdp='full_shard auto_wrap',fsdp_config=dict(version=2,cpu_ram_efficient_loading=True,
-            reshard_after_forward=True,transformer_layer_cls_to_wrap=['Qwen3_5MoeDecoderLayer','Qwen3_5MoeVisionBlock']),
+            reshard_after_forward=True,transformer_layer_cls_to_wrap=architecture_spec(plan['model']['architecture'])['wrap_classes']),
         kt_config=kt if backend=='kt' else None)
-    model=AutoModelForImageTextToText.from_pretrained(plan['model']['path'],dtype=torch.bfloat16,
+    arch_spec=architecture_spec(plan['model']['architecture'])
+    auto_model_cls=getattr(transformers,arch_spec['auto_model_cls'])
+    model=auto_model_cls.from_pretrained(plan['model']['path'],dtype=torch.bfloat16,
         device_map={'':f'cuda:{rank}' if backend=='kt' else 'cpu'},attn_implementation='sdpa',local_files_only=True)
-    if backend=='gpu':
+    if backend=='gpu' and arch_spec['needs_vlm_conv3d_patch']:
         from kt_kernel.sft.conv3d_compat import patch_vlm_conv3d
         patch_vlm_conv3d(model)
     if fp32_expert_accum:
@@ -95,7 +98,7 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
             return result.to(hidden_states.dtype)
         patched=0
         for module in model.modules():
-            if type(module).__name__=='Qwen3_5MoeExperts':
+            if type(module).__name__ in arch_spec['expert_module_names']:
                 module.forward=types.MethodType(expert_forward,module);patched+=1
         assert patched > 0, "No compatible GPU expert modules found"
     for p in model.parameters():
@@ -165,7 +168,8 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
     trainer=Probe(model=model,args=args,train_dataset=[{'input_ids':tokens} for _ in range(dist.get_world_size())],
         data_collator=lambda batch:{'input_ids':torch.tensor([batch[0]['input_ids']])},callbacks=[Check()])
     trainer.model_accepts_loss_kwargs=False
-    trainer.accelerator.state.fsdp_plugin.mixed_precision_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16,reduce_dtype=torch.float32)
+    reduce_dtype=getattr(torch,plan['actor']['mixed_precision_policy']['reduce_dtype'])
+    trainer.accelerator.state.fsdp_plugin.mixed_precision_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16,reduce_dtype=reduce_dtype)
     try:trainer.train()
     except Captured:pass
     else:raise RuntimeError('Gradient probe failed to stop before optimizer')
