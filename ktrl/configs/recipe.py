@@ -39,21 +39,29 @@ def read_model(config, recipe_dir):
         raw = json.loads(metadata.read_text(encoding="utf-8"))
     except json.JSONDecodeError as error:
         raise ValueError(f"{metadata}: {error}") from error
-    architecture = "Qwen3_5MoeForConditionalGeneration"
-    if not isinstance(raw, dict) or not isinstance(raw.get("architectures"), list) or architecture not in raw["architectures"]:
-        raise ValueError(f"{metadata}: KTRL currently requires the {architecture} architecture")
-    text = raw.get("text_config")
-    if not isinstance(text, dict):
-        raise ValueError(f"{metadata}: missing text_config")
-    count = integer(text.get("num_experts"), "text_config.num_experts")
+    supported = ("Qwen3_5MoeForConditionalGeneration", "Qwen3MoeForCausalLM")
+    archs = raw.get("architectures") if isinstance(raw, dict) else None
+    matched = [a for a in supported if isinstance(archs, list) and a in archs]
+    if not matched:
+        raise ValueError(f"{metadata}: KTRL currently requires one of {supported}")
+    architecture = matched[0]
+    if architecture == "Qwen3_5MoeForConditionalGeneration":
+        text = raw.get("text_config")
+        if not isinstance(text, dict):
+            raise ValueError(f"{metadata}: missing text_config")
+        prefix = "text_config."
+    else:
+        text = raw
+        prefix = ""
+    count = integer(text.get("num_experts"), f"{prefix}num_experts")
     return {
         "path": str(path),
         "metadata": str(metadata),
         "architecture": architecture,
         "dtype": require(config.get("dtype", "bfloat16"), f"{label}.dtype", ("bfloat16",)),
-        "text_layers": integer(text.get("num_hidden_layers"), "text_config.num_hidden_layers"),
+        "text_layers": integer(text.get("num_hidden_layers"), f"{prefix}num_hidden_layers"),
         "routed_experts_per_moe_layer": count,
-        "experts_per_token": integer(text.get("num_experts_per_tok"), "text_config.num_experts_per_tok", 1, count),
+        "experts_per_token": integer(text.get("num_experts_per_tok"), f"{prefix}num_experts_per_tok", 1, count),
     }
 
 

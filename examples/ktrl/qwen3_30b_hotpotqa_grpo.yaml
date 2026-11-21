@@ -1,0 +1,56 @@
+# KTRL FifthTask Phase 2/3 frozen recipe for Qwen3-30B-A3B + HotpotQA (distractor) on 8x RTX 4090.
+# Note: Precision (BF16 grad accum / FP32 master policy) and Actor offload remain Phase 3 decisions.
+algorithm:
+  adv_estimator: grpo
+  rollout_correction:
+    bypass_mode: false
+    rollout_is: null
+expert_placement:
+  strategy: uniform
+  gpu_experts_per_layer: 0
+actor_rollout_ref:
+  model:
+    path: /mnt/data/models/Qwen3-30B-A3B
+    dtype: bfloat16
+  rollout:
+    name: sglang
+    tp_size: 8
+    kt_method: BF16
+    kt_cpuinfer: 32
+    kt_threadpool_count: 2
+    mem_fraction_static: 0.35
+  actor:
+    strategy: fsdp2
+    world_size: 8
+    training_scope: full
+    nonexpert_parameter_dtype: float32  # Current parser baseline; Phase 3 precision policy pending user decision.
+    learning_rate: 1.0e-6
+    ppo_mini_batch_size: 4
+    ppo_epochs: 1
+    shuffle: false
+    data_loader_seed: 42
+    kt_num_threads: 48
+    kt_threadpool_count: 1
+  ref:
+    enabled: false
+    strategy: fsdp2
+critic:
+  enabled: false
+  strategy: fsdp2
+data:
+  train_file: /mnt/data/zjx/ktrl-fifth/data/hotpotqa_v1/train.parquet
+  prompts_per_step: 8
+  responses_per_prompt: 4
+  max_prompt_tokens: 2560
+  max_response_tokens: 512
+  context_length: 3072
+  seed: 42
+  overlong_buffer_tokens: 0  # Disabled for HotpotQA short answers so reward = 0.9*F1 + 0.1*format.
+trainer:
+  steps: 4
+  gradient_accumulation_steps: 2
+  optimizer_schedule_steps: 200
+  save_freq: 2
+  keep_full_checkpoints: 2
+profiling:
+  preset: light
