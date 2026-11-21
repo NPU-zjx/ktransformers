@@ -11,6 +11,9 @@ import time
 
 from .grpo import outcome_advantages
 from .math_reward import compute_score
+from .qa_reward import compute_qa_score
+
+SUPPORTED_DATA_SOURCES = frozenset({"math_dapo", "hotpotqa"})
 
 
 def write(path, data):
@@ -26,7 +29,7 @@ def select_prompts(rows, tokenize, count, seed, max_prompt_tokens):
     for index in indices:
         row = rows[index]
         ground_truth = (row.get("reward_model") or {}).get("ground_truth")
-        if row.get("data_source") != "math_dapo" or ground_truth is None:
+        if row.get("data_source") not in SUPPORTED_DATA_SOURCES or ground_truth is None:
             continue
         ids = tokenize(row["prompt"])
         if not 0 < len(ids) <= max_prompt_tokens:
@@ -78,7 +81,8 @@ def score(out, model):
             assert 0 < len(response) <= maximum and meta['prompt_tokens'] == len(question['prompt'])
             assert meta['finish_reason']['type'] in ('stop','length')
             text = tok.decode(response, skip_special_tokens=True)
-            base = compute_score(text, question['ground_truth'])
+            source = question.get('data_source', 'math_dapo')
+            base = compute_qa_score(text, question['ground_truth']) if source == 'hotpotqa' else compute_score(text, question['ground_truth'])
             penalty = min(-(len(response)-(maximum-buffer))/buffer,0) if buffer else 0.
             logps = meta['output_token_logprobs']
             assert [x[1] for x in logps] == response
@@ -132,7 +136,11 @@ def score(out, model):
           reward_interval_ns=[started,reward_end], advantage_interval_ns=[reward_end,advantage_end],
           provenance='Live KT-SGLang output IDs including actual EOS; no text re-encoding.',
           policy_version=recipe['policy_version'],
-          reward_recipe=f'math_dapo score +/-1; overlong buffer={buffer}; maximum={maximum}'))
+          reward_recipe=(
+              f'hotpotqa 0.9*F1+0.1*format; overlong buffer={buffer}; maximum={maximum}'
+              if {q.get('data_source', 'math_dapo') for q in prompts} == {'hotpotqa'}
+              else f'math_dapo score +/-1; overlong buffer={buffer}; maximum={maximum}'
+          )))
 
 
 if __name__ == '__main__':
