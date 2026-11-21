@@ -21,7 +21,9 @@ KTRL 在 KT 原生推理和微调能力上实现同步在线 GRPO。`ktrl run` �
 
 ## 入口与环境
 
-在单台 Linux GPU 主机上，按仓库的 KT 安装说明准备支持 KT 的 PyTorch、Transformers、Accelerate 和原生 SGLang 环境，安装 PyYAML 与 PyArrow，并初始化锁定的 `third_party/sglang` 子模块。当前 Actor 支持 KT 的 Qwen3.5 MoE 架构入口和 CPU 路由专家。
+在单台 Linux GPU 主机上，按仓库的 KT 安装说明准备支持 KT 的 PyTorch、Transformers、Accelerate 和原生 SGLang 环境，安装 PyYAML 与 PyArrow，并初始化锁定的 `third_party/sglang` 子模块。当前 Actor 原历史运行已验证 Qwen3.5 MoE；第五阶段 `kt-rl` 分支正将 `Qwen3MoeForCausalLM`（`Qwen3-30B-A3B`）与 `hotpotqa` 数据集接入在线管线。
+
+> **第五阶段当前状态声明**：`kt-rl` 分支截至 Phase 2 仅完成离线单元测试（55/55）、HotpotQA 预处理与 SFT `labels != -100` 长度审计及 `--dry-run` 配置解析；**30B 真实在线 RL、精度/offload 与恢复尚待 Phase 3 GPU 验收，推送不代表正式实验完成。**
 
 复制[示例配方](../examples/ktrl/qwen36_35b_grpo.yaml)，替换 `actor_rollout_ref.model.path` 和 `data.train_file`。模型目录需有 `config.json` 和本地权重。Parquet 需有聊天格式的 `prompt`、`data_source=math_dapo` 及 `reward_model.ground_truth`。路径支持绝对路径或相对配方目录。
 
