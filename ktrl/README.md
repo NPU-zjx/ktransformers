@@ -6,7 +6,9 @@ KTRL 在 KT 原生推理和微调能力上实现同步在线 GRPO。`ktrl run` �
 
 Qwen3-30B-A3B 的同步在线 GRPO 已在四卡 RTX 4090 D 上完成 6 个在线批次，其中 5 个非零优势有效轮、10 次优化器更新，最终发布 v10。生成、SQL 奖励、整批冻结 old logp、minibatch 更新和权重发布由控制器自动串联。Actor 与优化器跨轮保留，rollout 阶段通过 parking 将 GPU 训练状态转移至 CPU，训练前恢复。
 
-本次发布包含 Qwen3Moe、SynSQL 执行奖励、BF16 分片梯度累积、Actor parking、AMX 专家权重缓冲释放修复及 profiling。85 项 Linux 离线回归通过。历史 35B 多轮及 checkpoint 恢复记录见 [运行证据](docs/multi-round-status.md)。上述运行结果证明已验证配置的在线执行能力，长期学习效果、奖励可靠性和训推数值一致性仍待独立验收。
+本次发布包含 Qwen3Moe、SynSQL 执行奖励、BF16 分片梯度累积、rollout 阶段释放 Actor 训练状态显存、AMX 专家权重缓冲释放修复及 profiling。85 项 Linux 离线回归通过。历史 35B 多轮及 checkpoint 恢复记录见 [运行证据](docs/multi-round-status.md)。上述运行结果证明已验证配置的在线执行能力，长期学习效果、奖励可靠性和训推数值一致性仍待独立验收。
+
+四项主要修改及验收边界见 [KTRL 1.1.0 发布说明](docs/release-1.1.0.md)。
 
 开发与发布采用 [本机主仓库流程](docs/local-primary-workflow.md)。正式性能数据应注明模型、卡数、实际 token 数、精度和运行 ID。
 
