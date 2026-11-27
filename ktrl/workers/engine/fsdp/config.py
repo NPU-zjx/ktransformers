@@ -7,7 +7,7 @@ def plan_actor(config, placement):
     label = "actor_rollout_ref.actor"
     fields(config, label, (
         "strategy", "world_size", "training_scope", "kt_num_gpu_experts",
-        "kt_num_threads", "kt_threadpool_count", "nonexpert_parameter_dtype", "reduce_dtype", "learning_rate", "ppo_mini_batch_size", "ppo_epochs", "shuffle", "data_loader_seed",
+        "kt_num_threads", "kt_threadpool_count", "nonexpert_parameter_dtype", "reduce_dtype", "gradient_accumulation_dtype", "learning_rate", "ppo_mini_batch_size", "ppo_epochs", "shuffle", "data_loader_seed", "offload_gpu_state_during_rollout",
     ))
     strategy = require(config.get("strategy", "fsdp2"), f"{label}.strategy", ("fsdp2",))
     scope = require(config.get("training_scope", "full"), f"{label}.training_scope", ("full",))
@@ -17,7 +17,11 @@ def plan_actor(config, placement):
         raise ValueError(f"{label}.learning_rate must be finite and positive")
     if type(config.get("shuffle", False)) is not bool:
         raise ValueError(f"{label}.shuffle must be boolean")
+    offload = config.get("offload_gpu_state_during_rollout", False)
+    if type(offload) is not bool:
+        raise ValueError(f"{label}.offload_gpu_state_during_rollout must be boolean")
     return {
+        "offload_gpu_state_during_rollout": offload,
         "ppo_mini_batch_size": (integer(config["ppo_mini_batch_size"], f"{label}.ppo_mini_batch_size")
                                 if "ppo_mini_batch_size" in config else None),
         "ppo_epochs": integer(config.get("ppo_epochs", 1), f"{label}.ppo_epochs"),
@@ -30,7 +34,8 @@ def plan_actor(config, placement):
         "learning_rate": learning_rate,
         "nonexpert_parameter_dtype": require(config.get('nonexpert_parameter_dtype','float32'),
             f'{label}.nonexpert_parameter_dtype',('float32',)),
-        'mixed_precision_policy':{'param_dtype':'bfloat16','reduce_dtype':require(config.get('reduce_dtype','bfloat16'),f'{label}.reduce_dtype',('bfloat16','float32'))},
+        'mixed_precision_policy':{'param_dtype':'bfloat16','reduce_dtype':require(config.get('reduce_dtype','float32'),f'{label}.reduce_dtype',('bfloat16','float32'))},
+        'gradient_accumulation_dtype':require(config.get('gradient_accumulation_dtype','float32'),f'{label}.gradient_accumulation_dtype',('bfloat16','float32')),
         'cpu_expert_optimizer':{'name':'KTRL MasterAdamW','master_dtype':'float32',
             'moment_dtype':'float32','compute_copy_dtype':'bfloat16','gradient_buffer_dtype':'bfloat16','device':'cpu'},
         "fsdp_api": "torch.distributed.fsdp.fully_shard",

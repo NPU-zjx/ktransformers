@@ -143,7 +143,7 @@ def run_one(config_path, output, max_new_tokens, prompt_file):
     result = {
         "scope": "one KTRL rollout request", "backend": rollout["backend"],
         "request_id": rid, "prompt_file": str(Path(prompt_file).resolve()),
-        "submitted_requests": 1, "input_tokens": len(row["prompt"]), "output_tokens": len(ids), "output_ids": ids,
+        "submitted_requests": 1, "input_tokens": len(prompt), "output_tokens": len(ids), "output_ids": ids,
         "text": response["text"], "finish_reason": response["meta_info"]["finish_reason"],
         "client_request_seconds": seconds, "ranks": ranks,
         "decode_replay_batches_all_ranks": sum(r["decode_replay_batches"] for r in ranks),

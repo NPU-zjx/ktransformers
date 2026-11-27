@@ -15,6 +15,7 @@ from ktrl.configs.recipe import architecture_spec, load_plan
 from ktrl.trainer.grpo import policy_loss_sum
 from .actor_update import TokenLogProbs
 from . import checkpoint_context
+from .gradient_accumulation import BF16AccumulationTrainerMixin
 
 LAYERS={0,10,20,30,39}
 EXPERTS=[0,7,63,127,255]
@@ -71,6 +72,7 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
     if no_checkpoint:kt['kt_activation_policy']={'cpu':'retain','gpu':'retain'}
     args=TrainingArguments(output_dir=str(out/'unused'),max_steps=1,per_device_train_batch_size=1,
         gradient_accumulation_steps=1,learning_rate=1e-6,optim='adamw_torch',max_grad_norm=0,
+        accelerator_config={'gradient_accumulation_kwargs':{'sync_each_batch':True}},
         bf16=True,report_to='none',save_strategy='no',remove_unused_columns=False,dataloader_pin_memory=False,
         gradient_checkpointing=not no_checkpoint,gradient_checkpointing_kwargs=dict(use_reentrant=False,**({'context_fn':checkpoint_context} if backend=='kt' else {})),
         fsdp='full_shard auto_wrap',fsdp_config=dict(version=2,cpu_ram_efficient_loading=True,
@@ -157,7 +159,7 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
                     gpu_expert_accumulation='float32' if fp32_expert_accum else 'native')))
             raise Captured()
 
-    class Probe(Trainer):
+    class Probe(BF16AccumulationTrainerMixin, Trainer):
         def compute_loss(self,model,inputs,**kwargs):
             ids=inputs['input_ids']
             logits=model(input_ids=ids,use_cache=False,logits_to_keep=n+1).logits[0,:-1]
@@ -168,6 +170,7 @@ def main(config,rows_file,out,backend,trace=False,fp32_expert_accum=False,no_che
     trainer=Probe(model=model,args=args,train_dataset=[{'input_ids':tokens} for _ in range(dist.get_world_size())],
         data_collator=lambda batch:{'input_ids':torch.tensor([batch[0]['input_ids']])},callbacks=[Check()])
     trainer.model_accepts_loss_kwargs=False
+    trainer.gradient_accumulation_dtype=plan['actor']['gradient_accumulation_dtype']
     reduce_dtype=getattr(torch,plan['actor']['mixed_precision_policy']['reduce_dtype'])
     trainer.accelerator.state.fsdp_plugin.mixed_precision_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16,reduce_dtype=reduce_dtype)
     try:trainer.train()

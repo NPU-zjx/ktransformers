@@ -53,6 +53,21 @@ class AMX_MOE_BASE {
   std::vector<ggml_bf16_t*> m_local_up_output_ptr_;
   std::vector<ggml_bf16_t*> m_local_down_output_ptr_;
 
+  // BufferB is a non-owning view: own only allocations made by this class.
+  // Declared before views so views are destroyed before their backing storage.
+  struct FreeAlignedWeight {
+    void operator()(void* pointer) const noexcept { std::free(pointer); }
+  };
+  std::vector<std::unique_ptr<void, FreeAlignedWeight>> owned_weight_buffers_;
+
+  void* allocate_weight_buffer(size_t bytes) {
+    std::unique_ptr<void, FreeAlignedWeight> buffer(std::aligned_alloc(64, bytes));
+    if (!buffer) throw std::bad_alloc();
+    void* pointer = buffer.get();
+    owned_weight_buffers_.push_back(std::move(buffer));
+    return pointer;
+  }
+
   std::vector<std::shared_ptr<typename T::BufferA>> gate_up_ba_;
   std::vector<std::shared_ptr<typename T::BufferB>> gate_bb_;
   std::vector<std::shared_ptr<typename T::BufferC>> gate_bc_;
@@ -134,14 +149,14 @@ class AMX_MOE_BASE {
       down_bc_.push_back(make_buffer_c(config_.max_len, config_.hidden_size, nullptr));
 
       void* gate_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+          allocate_weight_buffer(buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       gate_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, gate_bb_ptr));
 
-      void* up_bb_ptr = std::aligned_alloc(64, buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
+      void* up_bb_ptr = allocate_weight_buffer(buffer_b_required_size(config_.intermediate_size, config_.hidden_size));
       up_bb_.push_back(make_buffer_b(config_.intermediate_size, config_.hidden_size, up_bb_ptr));
 
       void* down_bb_ptr =
-          std::aligned_alloc(64, buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
+          allocate_weight_buffer(buffer_b_required_size(config_.hidden_size, config_.intermediate_size));
       down_bb_.push_back(make_buffer_b(config_.hidden_size, config_.intermediate_size, down_bb_ptr));
     }
     // TODO: need update to all *.hpp

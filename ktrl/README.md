@@ -2,28 +2,27 @@
 
 KTRL 在 KT 原生推理和微调能力上实现同步在线 GRPO。`ktrl run` 由同一个控制器驱动 KT-SGLang rollout、奖励和优势计算、FSDP2 Actor 更新及权重发布。
 
-## 当前状态：多轮在线 RL 已实测跑通
+## 当前状态（2026-11-27）
 
-截至 2026-11-10 15:30（北京时间），35B 正式运行已累计完成 **19 个有更新的 RL 轮次、38 次优化器更新**，正在用最新发布的 `v38` 进行下一轮现场生成。已消费 21 批数据，其中 2 批优势全零而跳过更新；当前处理第 22 批。训练没有两轮上限，按配置和数据迭代。
+Qwen3-30B-A3B 的同步在线 GRPO 已在四卡 RTX 4090 D 上完成 6 个在线批次，其中 5 个非零优势有效轮、10 次优化器更新，最终发布 v10。生成、SQL 奖励、整批冻结 old logp、minibatch 更新和权重发布由控制器自动串联。Actor 与优化器跨轮保留，rollout 阶段通过 parking 将 GPU 训练状态转移至 CPU，训练前恢复。
 
-自动闭环为：现场 rollout → 奖励与 GRPO 优势 → 冻结整批 old logp → minibatch/多 epoch Actor 更新 → 权重发布 → 新策略下一批 rollout。Actor 与优化器跨轮常驻；已从完整 `checkpoint-20` 恢复并继续更新、发布和生成。详见[正式多轮运行证据快照](docs/multi-round-status.md)。
+本次发布包含 Qwen3Moe、SynSQL 执行奖励、BF16 分片梯度累积、Actor parking、AMX 专家权重缓冲释放修复及 profiling。85 项 Linux 离线回归通过。历史 35B 多轮及 checkpoint 恢复记录见 [运行证据](docs/multi-round-status.md)。上述运行结果证明已验证配置的在线执行能力，长期学习效果、奖励可靠性和训推数值一致性仍待独立验收。
 
-这里的“跑通”指实际多轮执行、状态接续和权重发布链路。13,376 题全量训练尚未完成，训推数值一致性及长期学习效果仍待验收。
+开发与发布采用 [本机主仓库流程](docs/local-primary-workflow.md)。正式性能数据应注明模型、卡数、实际 token 数、精度和运行 ID。
 
 ## 多轮如何自动接续
 
 1. [在线控制器](trainer/online_native.py) 从 base 策略 `v0` 启动 KT-SGLang，从配置指定的训练 Parquet 按 seed 打乱行号，每轮按配方取下一批题并现场生成回答。每个选中的数据行只消费一次。数据本身的重复题按原始行保留。
-2. [批次构造](trainer/online_batch.py) 直接读取服务返回的回答 token ID，计算数学奖励和组内 GRPO 优势。固定回答回放属于独立的 Actor 验证入口。
+2. [批次构造](trainer/online_batch.py) 直接读取服务返回的回答 token ID，按 data_source 计算数学、QA 或 SQL 奖励及组内 GRPO 优势。固定回答回放属于独立的 Actor 验证入口。
 3. 控制器等 rollout 排空并释放其显存，再把当轮批次交给 [FSDP2 Actor](workers/engine/fsdp/actor_update.py)。Actor 默认在整批更新前一次性计算并固定所有回答的 old logp，然后按 ppo_mini_batch_size 和 ppo_epochs 循环；每个 minibatch 按 GAS 完成反向、CPU/GPU 联合梯度裁剪和一次 AdamW 更新。所有 epoch 共享同一份只读 old logp。常驻模式在同一次 Trainer 调用中保留模型、优化器和调度器。
 4. Actor 完成本轮所有 minibatch/epoch 后导出一次模型权重。控制器恢复 rollout，通过[权重发布](weights/serving.py)将 CPU 专家直接加载到 CPU，并由原生 TP 加载器更新 GPU 参数。发布核对权重清单和每个 TP rank 的版本，重捕获 CUDA Graph。下一批用已发布的策略生成。整个批次优势均为零时记录并跳过优化器更新，策略版本保持不变。
 
-训练和推理共用逐层专家放置。路由专家留在 CPU。常驻模式每步磁盘导出约 70.86 GiB，用于推理发布。多轮运行在确认新版发布后仅移除本次运行被替代的权重分片，保留发布清单、日志和压缩的原始生成证据。trainer.save_freq（0 表示关闭）指定每隔多少个已更新的 RL 轮次保存完整状态；其余轮次只导出模型。--resume-from 指向已成功发布、带 ktrl-resume.json 的完整 checkpoint，恢复时使用新的输出目录。模型、数据、优化器/PPO 配置必须匹配，trainer.steps 表示整个数据计划的批数。trainer.keep_full_checkpoints 默认保留本次运行最新 1 个完整 checkpoint，只在较新完整状态成功发布后删除过期二进制；JSON、日志保留。旧运行及恢复来源目录不自动删除。保存时需预留新旧完整状态同时存在的磁盘空间。完整 checkpoint 恢复已在真实 GPU 上执行：从 checkpoint-20 恢复后继续完成第 11–19 个有更新的 RL 轮次；详见下方证据快照。
+训练和推理共用逐层专家放置。路由专家留在 CPU。常驻模式每轮导出模型供推理发布，导出大小取决于模型；35B 历史约70.86 GiB。多轮运行在确认新版发布后仅移除本次运行被替代的权重分片，保留发布清单、日志和压缩的原始生成证据。trainer.save_freq（0 表示关闭）指定每隔多少个已更新的 RL 轮次保存完整状态；其余轮次只导出模型。--resume-from 指向已成功发布、带 ktrl-resume.json 的完整 checkpoint，恢复时使用新的输出目录。模型、数据、优化器/PPO 配置必须匹配，trainer.steps 表示整个数据计划的批数。trainer.keep_full_checkpoints 默认保留本次运行最新 1 个完整 checkpoint，只在较新完整状态成功发布后删除过期二进制；JSON、日志保留。旧运行及恢复来源目录不自动删除。保存时需预留新旧完整状态同时存在的磁盘空间。完整 checkpoint 恢复已在真实 GPU 上执行：从 checkpoint-20 恢复后继续完成第 11–19 个有更新的 RL 轮次；详见下方证据快照。
 
 ## 入口与环境
 
-在单台 Linux GPU 主机上，按仓库的 KT 安装说明准备支持 KT 的 PyTorch、Transformers、Accelerate 和原生 SGLang 环境，安装 PyYAML 与 PyArrow，并初始化锁定的 `third_party/sglang` 子模块。当前 Actor 原历史运行已验证 Qwen3.5 MoE；第五阶段 `kt-rl` 分支正将 `Qwen3MoeForCausalLM`（`Qwen3-30B-A3B`）与 `hotpotqa` 数据集接入在线管线。
+在单台 Linux GPU 主机上，按仓库的 KT 安装说明准备支持 KT 的 PyTorch、Transformers、Accelerate 和原生 SGLang 环境，安装 PyYAML 与 PyArrow，并初始化锁定的 `third_party/sglang` 子模块。Actor 已有 Qwen3.5 MoE 历史运行和 Qwen3Moe 30B SynSQL 在线运行证据。
 
-> **第五阶段当前状态声明**：`kt-rl` 分支截至 Phase 2 仅完成离线单元测试（55/55）、HotpotQA 预处理与 SFT `labels != -100` 长度审计及 `--dry-run` 配置解析；**30B 真实在线 RL、精度/offload 与恢复尚待 Phase 3 GPU 验收，推送不代表正式实验完成。**
 
 复制[示例配方](../examples/ktrl/qwen36_35b_grpo.yaml)，替换 `actor_rollout_ref.model.path` 和 `data.train_file`。模型目录需有 `config.json` 和本地权重。Parquet 需有聊天格式的 `prompt`、`data_source=math_dapo` 及 `reward_model.ground_truth`。路径支持绝对路径或相对配方目录。
 
@@ -51,6 +50,6 @@ python3 -B -m ktrl run --config ./my-recipe.yaml --output-dir ./runs/rl-a01
 
 ## 当前变更验收状态
 
-当前正式运行采用整批冻结 old logp、ppo_epochs=2、每轮两次优化器更新；已完成多轮在线执行和完整 checkpoint 恢复接续。当前正式配置每个 epoch 只有一个 minibatch，因此这条长跑不能单独证明所有多 minibatch 配置。source.json 保存实际仓库路径、HEAD、工作树状态和 Python 源码摘要，launch.json 保存各子进程环境。运行中源码变化会阻止后续轮次，避免混用版本。配置中未实现的 ref/critic=true 会直接报错；不宣称支持参考模型 KL、奖励模型、多机或异步训练。
+35B 历史正式运行采用整批冻结 old logp、ppo_epochs=2、每轮两次优化器更新；已完成多轮在线执行和完整 checkpoint 恢复接续。当前正式配置每个 epoch 只有一个 minibatch，因此这条长跑不能单独证明所有多 minibatch 配置。source.json 保存实际仓库路径、HEAD、工作树状态和 Python 源码摘要，launch.json 保存各子进程环境。运行中源码变化会阻止后续轮次，避免混用版本。配置中未实现的 ref/critic=true 会直接报错；不宣称支持参考模型 KL、奖励模型、多机或异步训练。
 
 metrics.jsonl 自动记录已完成/跳过批次的奖励、回答正确率、长度、零信号比例、loss、梯度和训推差异。actor/optimizer-steps/ 保留每次优化器更新的证据，events-rank*.jsonl 记录各 minibatch 的 ratio 与实际 clip 比例。ratio=1 或 clip 比例0不是报错，不能为了触发clip伪造旧概率或修改奖励。

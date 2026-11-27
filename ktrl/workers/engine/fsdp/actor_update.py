@@ -22,6 +22,8 @@ from ktrl.trainer.grpo import policy_loss_sum, select_old_logp, token_tis_weight
 from ktrl.trainer.gradient_audit import watch_loss_scale, gradient_snapshot, verify_clip
 from ktrl.trainer.master_adamw import MasterAdamW
 from . import checkpoint_context
+from .gradient_accumulation import BF16AccumulationTrainerMixin
+from .residency import GPUStateParking, release_cuda_gradients, release_unused_router_weights
 
 
 def save(path, data):
@@ -275,6 +277,8 @@ class Evidence(TrainerCallback):
                             snapshot / f"{name}-rank{self.rank}.json")
         self.event("optimizer_step_verified", optimizer_step=state.global_step,
                    rollout_round=self.round_index)
+        released = release_cuda_gradients(self.trainer.optimizer)
+        self.event("cuda_gradients_released", bytes=released, optimizer_step=state.global_step)
         control.should_save = False
         if state.global_step < self.target_step:
             return control
@@ -305,6 +309,9 @@ class Evidence(TrainerCallback):
                 time.sleep(0.2)
             if json.loads((next_round / "actor-ready.json").read_text())["step"] != self.round_index + 1:
                 raise RuntimeError(f"Controller released the wrong Actor step: {next_round}")
+            if trainer.rollout_state_parking.parked:
+                restored = trainer.rollout_state_parking.restore()
+                save(next_round/f"actor-restored-rank{self.rank}.json", restored)
             dataset = FixedRows(next_round / "batch")
             validate_rows(dataset, self.plan)
             self.round_index += 1
@@ -386,7 +393,7 @@ class Evidence(TrainerCallback):
         self.event('update_direction_verified',weighted_delta_sum=total,surrogate_loss_drop=surrogate_drop)
 
 
-class GRPOTrainer(Trainer):
+class GRPOTrainer(BF16AccumulationTrainerMixin, Trainer):
     def _save_checkpoint(self, model, trial):
         started = time.monotonic()
         super()._save_checkpoint(model, trial)
@@ -412,6 +419,7 @@ class GRPOTrainer(Trainer):
         self.evidence, self.seen = evidence, []
         self.rollout_correction = rollout_correction
         super().__init__(train_dataset=dataset, callbacks=[evidence], **kwargs)
+        self.gradient_accumulation_dtype = evidence.plan['actor']['gradient_accumulation_dtype']
         self.model_accepts_loss_kwargs = False
         self.grad_norm = None
         self.scale_checks = 0
@@ -512,6 +520,9 @@ class GRPOTrainer(Trainer):
         self.evidence.event("backward_complete", uid=inputs["uid"], microbatch=len(self.seen))
         return loss
 
+    def on_bf16_accumulation(self, snapshot, accumulator):
+        self.evidence.event("gpu_gradient_accumulation", **snapshot)
+
     def _clip_grad_norm(self, model):
         # Synchronous audit before native clipping, not the post-clip callback.
         torch.cuda.synchronize()
@@ -604,6 +615,11 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
         if parameter.requires_grad and parameter.numel():
             assert parameter.device.type=='cuda'
             parameter.data=parameter.data.to(master_dtype)
+    # A loop variable would otherwise retain the original full lm_head after
+    # FSDP2 replaces module parameters with new DTensor Parameters.
+    del parameter
+    router_cleanup = release_unused_router_weights(model)
+    save(folder/f"router-cleanup-rank{dist.get_rank()}.json", router_cleanup)
     if not model._kt_wrappers:
         raise RuntimeError("Actor model has no KT expert layers")
     model.config.use_cache=False
@@ -615,6 +631,7 @@ def main(config_path, batch_dir, folder, restore_from=None, resume_training=Fals
     trainer.accelerator.state.fsdp_plugin.mixed_precision_policy=MixedPrecisionPolicy(
         param_dtype=torch.bfloat16,reduce_dtype=reduce_dtype)
     evidence.trainer=trainer
+    trainer.rollout_state_parking = GPUStateParking()
     trainer.accelerator.state.fsdp_plugin.set_state_dict_type("FULL_STATE_DICT")
     # Trainer initializes the FSDP plugin in sharded mode and rejects model-only
     # saves in that mode. Enable them after selecting the native full export.
@@ -643,8 +660,16 @@ def finish_round(trainer, evidence, model, *, model_only, synchronize=False):
     assert sorted(uid for part in all_uids for uid in part)==sorted(r["uid"] for r in dataset.rows for _ in range(evidence.plan["actor"]["ppo_epochs"]))
     dist.barrier()
     if synchronize:
+        # CPU gradient buffers belong to KT and must retain their contract.
+        released_grad_bytes = release_cuda_gradients(trainer.optimizer)
         torch.cuda.synchronize()
+        parking = None
+        if evidence.plan['actor']['offload_gpu_state_during_rollout']:
+            parking = trainer.rollout_state_parking.park(model, trainer.optimizer)
         torch.cuda.empty_cache()
+        save(folder/f"actor-idle-rank{rank}.json", dict(
+            released_cuda_gradient_bytes=released_grad_bytes, parking=parking,
+            allocated=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved()))
         save(folder/f"resident-rank{rank}.json", dict(pid=os.getpid(), step=trainer.state.global_step,
              scheduler_epoch=trainer.lr_scheduler.last_epoch, optimizer_id=id(trainer.optimizer),
              allocated=torch.cuda.memory_allocated(), reserved=torch.cuda.memory_reserved()))

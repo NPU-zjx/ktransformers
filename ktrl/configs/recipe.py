@@ -1,6 +1,7 @@
 """Resolve an offline KTRL plan from YAML and the model's config.json."""
 
 import json
+import math
 import shutil
 import os
 import sys
@@ -106,22 +107,53 @@ def optional_role(config, label):
 
 
 def plan_inputs(config, recipe_dir):
-    fields(config, "data", ("train_file", "prompts_per_step", "responses_per_prompt", "max_response_tokens", "max_prompt_tokens", "context_length", "seed", "overlong_buffer_tokens"))
+    fields(config, "data", ("train_file", "validation_file", "prompts_per_step", "responses_per_prompt", "max_response_tokens", "max_prompt_tokens", "context_length", "seed", "overlong_buffer_tokens"))
     train_file = config.get("train_file")
     if train_file is not None:
         train_file = path_from(train_file, "data.train_file", recipe_dir)
         if not train_file.is_file():
             raise ValueError(f"data.train_file: missing file {train_file}")
+    validation_file = config.get("validation_file")
+    if validation_file is not None:
+        validation_file = path_from(validation_file, "data.validation_file", recipe_dir)
+        if not validation_file.is_file():
+            raise ValueError(f"data.validation_file: missing file {validation_file}")
     prompts = integer(config.get("prompts_per_step", 8), "data.prompts_per_step")
     answers = integer(config.get("responses_per_prompt", 4), "data.responses_per_prompt", 2)
     response = integer(config.get('max_response_tokens',8192),'data.max_response_tokens')
     prompt = integer(config.get('max_prompt_tokens',1024),'data.max_prompt_tokens')
     context = integer(config.get('context_length',9216),'data.context_length',prompt+response)
-    return {"train_file": str(train_file) if train_file else None, "prompts_per_step": prompts,
+    return {"train_file": str(train_file) if train_file else None,
+            "validation_file": str(validation_file) if validation_file else None, "prompts_per_step": prompts,
             "responses_per_prompt": answers, "responses_per_update": prompts * answers,
             'max_response_tokens':response,'max_prompt_tokens':prompt,'context_length':context,
             'seed':integer(config.get('seed',42),'data.seed',0),
             'overlong_buffer_tokens':integer(config.get('overlong_buffer_tokens',0),'data.overlong_buffer_tokens',0,response)}
+
+
+def plan_reward(config, recipe_dir):
+    fields(config, "reward", ("name", "database_root", "timeout_seconds", "max_rows",
+                              "max_result_bytes", "float_abs_tol", "float_rel_tol"))
+    name = require(config.get("name", "auto"), "reward.name", ("auto", "sql_execution"))
+    if name == "auto":
+        if set(config) - {"name"}:
+            raise ValueError("SQL reward options require reward.name=sql_execution")
+        return {"name": name}
+    root = path_from(config.get("database_root"), "reward.database_root", recipe_dir)
+    if not root.is_dir():
+        raise ValueError(f"reward.database_root: missing directory {root}")
+    def number(key, default, positive=False):
+        value = config.get(key, default)
+        if type(value) not in (int, float) or not math.isfinite(value) or value < 0 or (positive and value == 0):
+            raise ValueError(f"reward.{key} must be finite and {'positive' if positive else 'nonnegative'}")
+        return value
+    timeout = number("timeout_seconds", 2.0, True)
+    if timeout > 60:
+        raise ValueError("reward.timeout_seconds must be <= 60")
+    return {"name": name, "database_root": str(root), "timeout_seconds": timeout,
+            "max_rows": integer(config.get("max_rows", 100000), "reward.max_rows", 1, 1000000),
+            "max_result_bytes": integer(config.get("max_result_bytes", 8388608), "reward.max_result_bytes", 1, 134217728),
+            "float_abs_tol": number("float_abs_tol", 1e-6), "float_rel_tol": number("float_rel_tol", 1e-6)}
 
 
 def profile_windows(preset):
@@ -138,7 +170,7 @@ def profile_windows(preset):
 def plan_runtime(config, recipe_dir):
     fields(config, "runtime", ("python", "actor_pythonpath", "rollout_pythonpath", "library_paths",
                                "cuda_visible_devices", "require_precision_gate", "export_min_free_gib",
-                               "final_probe_tokens"))
+                               "final_probe_tokens", "actor_cuda_allocator_conf"))
     interpreter = config.get("python", sys.executable)
     if not isinstance(interpreter, str) or not interpreter.strip():
         raise ValueError("runtime.python must be a nonempty path")
@@ -166,7 +198,11 @@ def plan_runtime(config, recipe_dir):
     gate = config.get("require_precision_gate", False)
     if type(gate) is not bool:
         raise ValueError("runtime.require_precision_gate must be true or false")
-    return dict(python=str(python), cuda_visible_devices=devices, require_precision_gate=gate,
+    actor_allocator = config.get("actor_cuda_allocator_conf")
+    if actor_allocator is not None and (not isinstance(actor_allocator, str) or not actor_allocator.strip()):
+        raise ValueError("runtime.actor_cuda_allocator_conf must be a nonempty string")
+    return dict(actor_cuda_allocator_conf=actor_allocator,
+                python=str(python), cuda_visible_devices=devices, require_precision_gate=gate,
                 final_probe_tokens=integer(config.get("final_probe_tokens", 32), "runtime.final_probe_tokens", 2),
                 export_min_free_gib=integer(config.get("export_min_free_gib", 0),
                                             "runtime.export_min_free_gib", 0), **paths)
@@ -178,7 +214,7 @@ def _read_recipe(config_path):
         raw = yaml.load(path.read_text(encoding="utf-8"), Loader=RecipeLoader)
     except yaml.YAMLError as error:
         raise ValueError(f"{path}: {error}") from error
-    cfg = fields(raw, "recipe", ("algorithm", "actor_rollout_ref", "expert_placement", "critic", "data", "trainer", "profiling", "runtime"))
+    cfg = fields(raw, "recipe", ("algorithm", "actor_rollout_ref", "expert_placement", "critic", "data", "trainer", "profiling", "runtime", "reward"))
     group = fields(cfg.get("actor_rollout_ref"), "actor_rollout_ref", ("model", "rollout", "actor", "ref"))
     return path, cfg, group
 
@@ -243,6 +279,7 @@ def load_plan(config_path, *, steps=None, profiling=None):
         "orchestrator": "KTRL",
         "recipe": str(path),
         "algorithm": estimator,
+        "reward": plan_reward(cfg.get("reward", {}), path.parent),
         "rollout_correction": {"bypass_mode": bypass, "rollout_is": rollout_is, "rollout_is_threshold": threshold},
         "runtime": runtime,
         "model": model,

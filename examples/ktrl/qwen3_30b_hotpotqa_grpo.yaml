@@ -25,6 +25,7 @@ actor_rollout_ref:
     training_scope: full
     nonexpert_parameter_dtype: float32  # GPU FSDP2 FP32 shard high-precision update base.
     reduce_dtype: bfloat16              # Scheme B: BF16 FSDP2 gradient reduction.
+    gradient_accumulation_dtype: bfloat16  # Explicit BF16 shard sum across microbatches; FP32 only at clip/update.
     learning_rate: 1.0e-6
     ppo_mini_batch_size: 4
     ppo_epochs: 1
@@ -43,8 +44,8 @@ data:
   prompts_per_step: 8
   responses_per_prompt: 4
   max_prompt_tokens: 2560
-  max_response_tokens: 512
-  context_length: 3072
+  max_response_tokens: 1024
+  context_length: 3584
   seed: 42
   overlong_buffer_tokens: 0  # Disabled for HotpotQA short answers so reward = 0.9*F1 + 0.1*format.
 trainer:

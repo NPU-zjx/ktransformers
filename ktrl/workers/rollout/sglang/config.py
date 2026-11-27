@@ -7,7 +7,7 @@ def plan_rollout(config, model, recipe_dir, placement):
     label = "actor_rollout_ref.rollout"
     fields(config, label, (
         "name", "tp_size", "kt_method", "kt_weight_path", "kt_num_gpu_experts",
-        "kt_expert_placement_strategy", "kt_cpuinfer", "kt_threadpool_count", "mem_fraction_static",
+        "kt_expert_placement_strategy", "kt_cpuinfer", "kt_threadpool_count", "mem_fraction_static", "enable_prefix_cache", "disable_overlap_schedule",
     ))
     require(config.get("name", "sglang"), f"{label}.name", ("sglang",))
     weights = path_from(config.get("kt_weight_path", model["path"]), f"{label}.kt_weight_path", recipe_dir)
@@ -16,7 +16,12 @@ def plan_rollout(config, model, recipe_dir, placement):
     mem_fraction = config.get("mem_fraction_static", 0.35)
     if type(mem_fraction) not in (int, float) or not 0 < mem_fraction <= 1:
         raise ValueError(f"{label}.mem_fraction_static must be in (0, 1]")
+    for key in ("enable_prefix_cache", "disable_overlap_schedule"):
+        if type(config.get(key, False)) is not bool:
+            raise ValueError(f"{label}.{key} must be boolean")
     args = {
+        "disable_radix_cache": not config.get("enable_prefix_cache", False),
+        "disable_overlap_schedule": config.get("disable_overlap_schedule", False),
         "model_path": model["path"],
         "dtype": model["dtype"],
         "tp_size": integer(config.get("tp_size", 1), f"{label}.tp_size"),

@@ -38,6 +38,9 @@ def environment(out, actor, runtime):
                                                ([env["LD_LIBRARY_PATH"]] if env.get("LD_LIBRARY_PATH") else []))
     inherited = [env["PYTHONPATH"]] if env.get("PYTHONPATH") else []
     if actor:
+        if runtime.get("actor_cuda_allocator_conf"):
+            env.pop("PYTORCH_CUDA_ALLOC_CONF", None)
+            env["PYTORCH_ALLOC_CONF"] = runtime["actor_cuda_allocator_conf"]
         env.update(PYTHONPATH=os.pathsep.join([str(REPO), *runtime["actor_pythonpath"], *inherited]),
                    KT_SFT_PROFILE='1')
     else:
@@ -205,7 +208,7 @@ def service(config,folder,plan):
         '--context-length',str(plan['inputs']['context_length']),
         '--max-running-requests',str(batch),'--chunked-prefill-size',str(plan["inputs"]["max_prompt_tokens"]),
         '--cuda-graph-max-bs',str(batch),
-        '--disable-radix-cache','--disable-shared-experts-fusion','--random-seed',str(plan['inputs']['seed']),
+        '--disable-shared-experts-fusion','--random-seed',str(plan['inputs']['seed']),
         '--skip-server-warmup','--enable-memory-saver','--enable-weights-cpu-backup','--sampling-backend','pytorch']
     env=environment(folder,False,runtime)
     save(folder/'launch.json',dict(argv=argv,environment=env_subset(env),name=name,port=port))
@@ -267,7 +270,7 @@ def generate(client,folder,questions,inputs,policy,tp_size):
     def one(pair):
         wave,index=pair
         uid=f'm4-w{wave}-q{index:02d}'
-        payload=dict(rid=uid,input_ids=questions[index]['prompt'],stream=False,return_logprob=True,
+        payload=dict(rid=f"{uid}-{uuid.uuid4().hex}",input_ids=questions[index]['prompt'],stream=False,return_logprob=True,
             sampling_params=dict(temperature=1.,top_p=1.,top_k=-1,max_new_tokens=inputs['max_response_tokens'],
                 sampling_seed=inputs['seed']+questions[index]['dataset_row']*inputs['responses_per_prompt']+wave,
                 ignore_eos=False))
@@ -420,6 +423,7 @@ def run(config,out,*,steps=2,final_model_only=False,resident_actor=False,resume_
                         policy=f'v{actor_start}'
                         save(current/'round.json',dict(**plan['inputs'],policy_version=policy,
                             rollout_correction=plan["rollout_correction"],
+                            reward=plan.get("reward", {"name": "auto"}),
                             dataset_batch=batch_index+1, dataset_rows=[q["dataset_row"] for q in questions],
                             actor_resume_checkpoint=str(checkpoint) if checkpoint and not resident_actor else None,
                             resident_actor=resident_actor))
